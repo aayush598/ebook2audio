@@ -211,6 +211,23 @@ class PDFToAudiobookConverter:
         
         return chapters
     
+    def _force_json_array(self, text: str) -> str:
+        """
+        Force model output into valid JSON array.
+        Removes markdown, extra text, and extracts the first [...].
+        """
+
+        # Remove markdown code blocks
+        text = text.replace("```json", "").replace("```", "").strip()
+
+        # Find first JSON array
+        match = re.search(r'\[\s*{.*}\s*\]', text, flags=re.DOTALL)
+        if match:
+            return match.group(0)
+
+        # If no array found → force wrap entire output
+        return "[" + text + "]"
+
     def break_into_subtopics(self, chapter_content: str, chapter_title: str) -> List[Dict[str, str]]:
         """
         Break chapter into detailed subtopics using Gemini
@@ -250,9 +267,11 @@ Return ONLY a JSON array:
 REMEMBER: Hindi in Devanagari (हिंदी), English in English. NO Roman transliteration!"""
         
         response = self.agent.run(prompt)
+        raw = response.content.strip()
+        raw = self._force_json_array(raw)
         
         try:
-            subtopics = json.loads(response.content)
+            subtopics = json.loads(raw)
             
             # Validate subtopic length
             for subtopic in subtopics:
