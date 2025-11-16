@@ -1,0 +1,6 @@
+audiobook_output
+.venv
+.env
+temp_chapters
+*.pdf
+*.wav
