@@ -1,6 +1,6 @@
 """
 Educational Manhwa-Style Audiobook Generator with TTS Script Generation
-Multi-step generation with clean narration for audio
+Multi-step generation with clean YouTube-style Hindi narration for audio
 """
 
 import os
@@ -24,7 +24,7 @@ KOKORO_REPO_ID = "leonelhs/kokoro-thewh1teagle"
 OUTPUT_DIR = "manhwa_audiobooks"
 CHAPTERS_DIR = "manhwa_chapters"
 METADATA_DIR = "manhwa_metadata"
-SCRIPTS_DIR = "tts_scripts"  # New directory for TTS scripts
+SCRIPTS_DIR = "tts_scripts"
 
 VOICES = {
     'Female Alpha': 'hf_alpha',
@@ -81,7 +81,7 @@ class ManhwaStoryGenerator:
             markdown=False,
         )
         
-        # NEW: Initialize TTS Script Generator Agent
+        # Initialize TTS Script Generator Agent
         self.script_generator = Agent(
             name="TTS Script Generator",
             model=Gemini(id=model_id, api_key=gemini_api_key),
@@ -98,7 +98,7 @@ class ManhwaStoryGenerator:
         Path(OUTPUT_DIR).mkdir(exist_ok=True)
         Path(CHAPTERS_DIR).mkdir(exist_ok=True)
         Path(METADATA_DIR).mkdir(exist_ok=True)
-        Path(SCRIPTS_DIR).mkdir(exist_ok=True)  # New directory
+        Path(SCRIPTS_DIR).mkdir(exist_ok=True)
     
     def _get_planner_instructions(self) -> str:
         """Get instructions for story planner agent"""
@@ -138,52 +138,45 @@ Format: Pure story text, end with "📚 CHAPTER LESSONS" section."""
         return base
     
     def _get_script_instructions(self) -> str:
-        """NEW: Get instructions for TTS script generator"""
-        base = """You are an expert audiobook narrator for Indian audiences who speak natural Hinglish.
+        """Get instructions for TTS script generator - YouTube style"""
+        base = """You are a Hindi manhwa storyteller on YouTube - like Anime Samrat, Anime Explain, or Hindi Manga Explained channels.
 
-YOUR TASK: Convert manhwa chapter into clean Hinglish narration for Text-to-Speech.
+YOUR STYLE: Natural Hindi narration like YouTubers explain manhwa/anime stories.
 
-CRITICAL LANGUAGE RULES - HINGLISH (NATURAL INDIAN STYLE):
-1. Use MIXED Hindi-English like normal Indians talk
-2. Character names in ENGLISH: Anya, Kaito, Seraphina (NOT अन्या, काइटो)
-3. Common English words Indians use daily: mobile, computer, game, city, academy, building, technology, teacher, student, food, water, etc.
-4. Hindi words for actions, feelings, connecting words: था, है, ने कहा, सोचा, देखा, लेकिन, क्योंकि, etc.
-5. Technical terms: Keep simple English OR use common Hindi
-   - "strategy" → "strategy" (Indians understand this)
-   - "resource" → "resources" (commonly used)
-   - "planning" → "planning" (everyday word)
-6. NO शुद्ध हिंदी (pure literary Hindi) that people don't use
-7. Think: How do friends chat on WhatsApp or talk casually?
+LANGUAGE RULES (YouTube Style):
+1. **Mostly HINDI** - Use simple, conversational Hindi that YouTubers use
+2. **English only for**:
+   - Character names: Anya, Kaito, Marcus (as written)
+   - Ranks/titles: Commander, Prince, Emperor, Guard
+   - Technical terms everyone knows: strategy, resources, technology, army, palace
+3. **Simple connecting words**: फिर, लेकिन, और, तो, अचानक, इसलिए
+4. **Natural flow**: जैसे दोस्त को कहानी सुना रहे हो
 
-EXAMPLES OF NATURAL HINGLISH:
-✓ "Anya ने सोचा कि strategy क्या होनी चाहिए"
-✓ "City में technology का जादू था"
-✓ "Kaito ने resources ko distribute किया"
-✓ "Game में sab log nervous थे"
-✗ "अन्या ने योजना के विषय में विचार किया" (too formal/pure)
+EXAMPLES (YouTube Narrator Style):
+✓ "Anya बहुत परेशान थी। उसे समझ नहीं आ रहा था कि क्या करे।"
+✓ "Commander ने army को रोका और कहा - रुको!"
+✓ "Palace में अचानक खतरा आ गया। Guards भागे लेकिन late हो गए।"
+✓ "Marcus ने strategy बदल दी। अब plan बिल्कुल नया था।"
 
-FORMATTING RULES:
-1. REMOVE all symbols: **, *, ##, ===, ---, (), []
-2. REMOVE panel/scene markers completely
-3. REMOVE visual descriptions
-4. REMOVE caption/narrator labels
-5. Convert "CHARACTER:" to "Character ने कहा:"
-6. REMOVE thought bubble markers
-7. REMOVE all emojis
-8. Keep story flowing naturally
+✗ "Anya ने सोचा कि strategy क्या होनी चाहिए" (too mixed)
+✗ "City में technology का जादू था" (too much English mixing)
+
+CLEAN OUTPUT RULES:
+1. NO special characters: **, *, ##, ===, ---, (), [], emojis
+2. NO scene markers: (Panel 1), Scene 2, दृश्य
+3. NO visual descriptions: (Shows palace), (Visual: army)
+4. Simple dialogue: "Character ने कहा - dialogue here"
+5. Short, clear sentences
+6. Natural pauses with periods
 
 STRUCTURE:
-1. Chapter title (in Hinglish)
-2. पूरी story without interruption
-3. Lessons at the END only
+- Chapter title in simple Hindi
+- Complete story without breaks
+- Lessons section at the very end
 
-EXAMPLE CONVERSION:
-Bad: "Anya thought about the strategy for resource allocation"
-Good: "अन्या ने सोचा कि resources को कैसे बांटा जाए"
+THINK: You're recording a YouTube video explaining a manhwa chapter to Hindi viewers. Keep it simple, engaging, and easy to follow!
 
-Bad: "**CAPTION:** The city of tomorrow"
-Good: "भविष्य का शहर दिखाई दे रहा था"
-OUTPUT: Natural Hinglish text (देवनागरी script + English names/common words), story first, lessons at end."""
+OUTPUT: Clean Hindi text with English names/titles, no special formatting, natural storytelling flow."""
         
         return base
     
@@ -580,70 +573,68 @@ End of Chapter {chapter_num}
         user_id: str = "default_user",
         progress_callback=None
     ) -> str:
-        """NEW: Generate clean TTS-ready script from chapter content"""
+        """Generate clean TTS-ready script from chapter content"""
         
         if progress_callback:
-            progress_callback("🎙️ Hinglish audio script बनाई जा रही है...", 0.0)
+            progress_callback("🎙️ Creating YouTube-style narration...", 0.0)
         
-        prompt = f"""इस manhwa chapter को natural Hinglish audio story में convert करो।
+        prompt = f"""तुम एक Hindi YouTube manhwa narrator हो। इस chapter को simple Hindi में explain करो - जैसे तुम video में story सुना रहे हो।
 
 Chapter Content:
 {chapter_content}
 
-Important Instructions:
+NARRATION STYLE (YouTube Explainer):
 
-1. LANGUAGE - NATURAL HINGLISH (जैसे लोग बोलते हैं):
+1. **LANGUAGE - Simple Hindi + English names**:
+   ✓ "Anya बहुत चिंतित थी। उसे समझ नहीं आ रहा था।"
+   ✓ "Commander ने army को आदेश दिया - रुको यहीं!"
+   ✓ "Palace में अचानक खतरा आ गया।"
+   ✓ "Marcus की strategy बिल्कुल अलग थी।"
    
-   ✓ Character names: ENGLISH में - Anya, Kaito, Seraphina, Marcus
-   ✓ Common words: mobile, computer, game, city, academy, technology, food, water, strategy, resources, planning
-   ✓ Hindi: था, है, ने कहा, सोचा, देखा, गया, हुआ, लेकिन, और, क्योंकि, कैसे, क्या
-   
-   Examples:
-   ✓ "Anya ने sोचा कि strategy क्या बनानी है"
-   ✓ "City बहुत beautiful थी और technology से भरी थी"
-   ✓ "Kaito ne resources ko carefully distribute किया"
-   ✓ "Game में participants nervous थे"
-   
-   ✗ "अन्या ने योजना बनाने का विचार किया" (बहुत formal)
-   ✗ "नगर अत्यंत सुंदर था" (ऐसे कोई नहीं बोलता)
+   ✗ "Anya ने strategy ko consider किया" (too much English mixing)
+   ✗ "अन्या अत्यंत चिंतित थी" (too formal)
 
-2. STORY ORDER:
-   - पहले complete story बिना रुकावट के
-   - सभी lessons केवल END में
-   - बीच में कोई lesson नहीं
+2. **English sirf yaha use karo**:
+   - Names: Anya, Kaito, Marcus, Seraphina
+   - Titles: Commander, Prince, Emperor, Guard
+   - Common terms: army, palace, strategy, resources
 
-3. CLEAN करो:
-   - सभी symbols हटाओ: **, *, ##, ===, ---, (), []
-   - Panel/Scene markers हटाओ
-   - Visual descriptions हटाओ
-   - "CHARACTER:" को "Character ने कहा:" में convert करो
-   - Emojis हटाओ
+3. **CLEAN FORMAT**:
+   - NO symbols: **, *, ##, ===, (), []
+   - NO scene markers
+   - NO visual descriptions
+   - Dialogue: "Character ने कहा - dialogue"
+   - Short, clear sentences
 
-4. FLOW:
-   - Story natural तरीके से flow होनी चाहिए
-   - जैसे कोई friend को story सुना रहा हो
-   - Simple sentences, आसान language
+4. **STRUCTURE**:
+   - Chapter title
+   - Pure story (no breaks)
+   - Lessons at END only
 
-More Examples:
-- "Anya hungry थी और पैसे नहीं थे"
-- "Oracle ने कहा कि tumhe task complete करना होगा"
-- "Settlement में लोगों को food और water चाहिए था"
-- "Kaito methodical approach use कर रहा था"
-- "Seraphina ने Marcus se collaborate किया"
+THINK: तुम YouTube video record कर रहे हो। Simple Hindi बोलो, natural flow रखो।
 
-OUTPUT: Natural Hinglish (देवनागरी + English names/common words), story पहले, lessons अंत में।"""
+OUTPUT: साफ Hindi text, English names के साथ, बिना special characters के।"""
         
         response = self.script_generator.run(prompt, user_id=user_id)
         tts_script = response.content.strip()
         
         if progress_callback:
-            progress_callback("✅ Hinglish script ready", 1.0)
+            progress_callback("🧹 Deep cleaning script...", 0.6)
         
-        # Additional cleaning (safety net)
+        # Deep cleaning (safety net)
         tts_script = self._deep_clean_script(tts_script)
+        
+        if progress_callback:
+            progress_callback("📝 Organizing content...", 0.8)
         
         # Ensure lessons are at the end
         tts_script = self._move_lessons_to_end(tts_script)
+        
+        # Final validation and fixes
+        tts_script = self._final_tts_validation(tts_script)
+        
+        if progress_callback:
+            progress_callback("✅ TTS script ready!", 1.0)
         
         # Save TTS script
         script_file = os.path.join(
@@ -658,42 +649,76 @@ OUTPUT: Natural Hinglish (देवनागरी + English names/common words)
     def _deep_clean_script(self, text: str) -> str:
         """Deep clean script for TTS - remove all problematic characters"""
         
-        # Remove markdown formatting
-        text = re.sub(r'\*\*.*?\*\*', lambda m: m.group(0).replace('**', ''), text)
-        text = re.sub(r'\*.*?\*', lambda m: m.group(0).replace('*', ''), text)
-        text = re.sub(r'##.*?##', lambda m: m.group(0).replace('##', ''), text)
+        # Remove ALL markdown formatting
+        text = re.sub(r'\*+', '', text)  # Remove all asterisks
+        text = re.sub(r'#+', '', text)  # Remove all hashes
+        text = re.sub(r'_+', '', text)  # Remove underscores
         
-        # Remove panel/scene markers
-        text = re.sub(r'\(Panel \d+\)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\(पैनल \d+\)', '', text)
-        text = re.sub(r'\*\*Scene \d+\*\*', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'Scene \d+:', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'दृश्य \d+:', '', text)
+        # Remove ALL brackets and parentheses content
+        text = re.sub(r'\[.*?\]', '', text)  # Remove [content]
+        text = re.sub(r'\(.*?\)', '', text)  # Remove (content)
+        text = re.sub(r'\{.*?\}', '', text)  # Remove {content}
         
-        # Remove visual descriptions in parentheses
-        text = re.sub(r'\(Visual:.*?\)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\(.*?visual.*?\)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\(दृश्य:.*?\)', '', text)
+        # Remove panel/scene markers (multiple patterns)
+        text = re.sub(r'(?i)panel\s*\d+', '', text)
+        text = re.sub(r'(?i)scene\s*\d+', '', text)
+        text = re.sub(r'(?i)दृश्य\s*\d+', '', text)
+        text = re.sub(r'(?i)पैनल\s*\d+', '', text)
         
-        # Remove caption markers
-        text = re.sub(r'\*\*CAPTION:\*\*', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'NARRATOR:', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'कथावाचक:', '', text)
+        # Remove visual/caption markers
+        text = re.sub(r'(?i)visual:', '', text)
+        text = re.sub(r'(?i)caption:', '', text)
+        text = re.sub(r'(?i)narrator:', '', text)
+        text = re.sub(r'(?i)कथावाचक:', '', text)
         
-        # Clean character dialogue markers - keep Hindi style
-        # Don't convert to English "says"
-        text = re.sub(r'([A-Z][A-Z]+):', r'\1 ने कहा:', text)
-        
-        # Remove emojis and special symbols
-        text = re.sub(r'[📚📖✅❌⚠️🎬🎯👥📜🔍💾🎙️🎵]', '', text)
+        # Remove ALL emojis and special symbols
+        emoji_pattern = re.compile("["
+            u"\U0001F600-\U0001F64F"  # emoticons
+            u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+            u"\U0001F680-\U0001F6FF"  # transport & map
+            u"\U0001F1E0-\U0001F1FF"  # flags
+            u"\U00002500-\U00002BEF"  # chinese/japanese/korean
+            u"\U00002702-\U000027B0"
+            u"\U000024C2-\U0001F251"
+            u"\U0001f926-\U0001f937"
+            u"\U00010000-\U0010ffff"
+            u"\u2640-\u2642" 
+            u"\u2600-\u2B55"
+            u"\u200d"
+            u"\u23cf"
+            u"\u23e9"
+            u"\u231a"
+            u"\ufe0f"  # dingbats
+            u"\u3030"
+            "]+", flags=re.UNICODE)
+        text = emoji_pattern.sub(r'', text)
         
         # Remove extra separators
-        text = re.sub(r'={3,}', '', text)
-        text = re.sub(r'-{3,}', '', text)
+        text = re.sub(r'[=\-_]{3,}', '', text)  # Remove ===, ---, ___
+        text = re.sub(r'[•·∙‣⁃]', '', text)  # Remove bullet points
         
-        # Clean whitespace
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r' {2,}', ' ', text)
+        # Fix dialogue markers - convert to natural Hindi
+        # "CHARACTER:" → "Character ने कहा -"
+        text = re.sub(r'([A-Z][A-Za-z]+):\s*', r'\1 ने कहा - ', text)
+        
+        # Remove quotation marks (they cause TTS issues)
+        text = re.sub(r'["""\'\'`]', '', text)
+        
+        # Fix spacing issues
+        text = re.sub(r'\s+([।,])', r'\1', text)  # Remove space before punctuation
+        text = re.sub(r'([।,])\s*', r'\1 ', text)  # Add single space after punctuation
+        text = re.sub(r'([.!?])\s*', r'\1 ', text)  # Add single space after sentence endings
+        
+        # Clean up whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 newlines
+        text = re.sub(r' {2,}', ' ', text)  # Single spaces only
+        text = re.sub(r'\t+', ' ', text)  # Replace tabs with space
+        
+        # Remove orphaned punctuation
+        text = re.sub(r'^\s*[,।.!?-]\s*', '', text, flags=re.MULTILINE)
+        
+        # Ensure proper sentence endings
+        text = re.sub(r'([^.!?।])\n', r'\1। ', text)  # Add period if missing at line end
         
         return text.strip()
     
@@ -734,6 +759,47 @@ OUTPUT: Natural Hinglish (देवनागरी + English names/common words)
                 lesson = lesson.strip()
                 if lesson:
                     text += f"{i}. {lesson}\n\n"
+        
+        return text.strip()
+    
+    def _final_tts_validation(self, text: str) -> str:
+        """Final validation and fixes for TTS script"""
+        
+        # Ensure no code blocks or markdown remain
+        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+        text = re.sub(r'`.*?`', '', text)
+        
+        # Remove any remaining special characters that break TTS
+        text = re.sub(r'[<>{}[\]\\|]', '', text)
+        
+        # Fix common TTS pronunciation issues
+        # Ensure numbers are spelled out or in proper format
+        text = re.sub(r'(\d+)\s*-\s*(\d+)', r'\1 से \2', text)  # "1-10" → "1 से 10"
+        
+        # Ensure proper spacing around Devanagari punctuation
+        text = re.sub(r'\s*।\s*', '। ', text)
+        
+        # Remove any lines that are just whitespace or punctuation
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            if line is None:
+                continue
+            line = str(line).strip()
+            # Skip lines with only punctuation/whitespace
+            # if line and not re.match(r'^[।.,!?;\s=_-]+$', line):
+            #     cleaned_lines.append(line)
+            cleaned_lines.append(line)
+        
+        text = '\n'.join(cleaned_lines)
+        
+        # Final whitespace cleanup
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' +', ' ', text)
+        
+        # Ensure text ends with proper punctuation
+        if text and not text[-1] in '.।!?':
+            text += '।'
         
         return text.strip()
     
@@ -857,7 +923,7 @@ def main():
     )
     
     st.title("📚 Educational Manhwa Audiobook Generator")
-    st.markdown("*Multi-step generation with clean TTS narration*")
+    st.markdown("*YouTube-style Hindi narration with clean TTS*")
     
     # Sidebar
     with st.sidebar:
