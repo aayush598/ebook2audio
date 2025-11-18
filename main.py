@@ -1,13 +1,13 @@
 """
-Educational Manhwa-Style Audiobook Generator with Agno Framework
-Multi-step generation to avoid token limits
+Educational Manhwa-Style Audiobook Generator with TTS Script Generation
+Multi-step generation with clean narration for audio
 """
 
 import os
 import json
 import re
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import streamlit as st
 from agno.agent import Agent
 from agno.models.google import Gemini
@@ -24,6 +24,7 @@ KOKORO_REPO_ID = "leonelhs/kokoro-thewh1teagle"
 OUTPUT_DIR = "manhwa_audiobooks"
 CHAPTERS_DIR = "manhwa_chapters"
 METADATA_DIR = "manhwa_metadata"
+SCRIPTS_DIR = "tts_scripts"  # New directory for TTS scripts
 
 VOICES = {
     'Female Alpha': 'hf_alpha',
@@ -41,7 +42,7 @@ GEMINI_MODELS = {
 
 
 class ManhwaStoryGenerator:
-    """Generates educational manhwa-style stories with multi-step generation"""
+    """Generates educational manhwa-style stories with TTS-ready scripts"""
     
     def __init__(
         self, 
@@ -60,7 +61,7 @@ class ManhwaStoryGenerator:
         # Initialize database for memory
         self.db = SqliteDb(db_file="manhwa_memory.db")
         
-        # Initialize Story Planning Agent with Memory
+        # Initialize Story Planning Agent
         self.story_planner = Agent(
             name="Manhwa Story Planner",
             model=Gemini(id=model_id, api_key=gemini_api_key),
@@ -70,13 +71,23 @@ class ManhwaStoryGenerator:
             markdown=False,
         )
         
-        # Initialize Chapter Writer Agent with Memory
+        # Initialize Chapter Writer Agent
         self.chapter_writer = Agent(
             name="Educational Manhwa Writer",
             model=Gemini(id=model_id, api_key=gemini_api_key),
             db=self.db,
             enable_user_memories=True,
             instructions=self._get_writer_instructions(),
+            markdown=False,
+        )
+        
+        # NEW: Initialize TTS Script Generator Agent
+        self.script_generator = Agent(
+            name="TTS Script Generator",
+            model=Gemini(id=model_id, api_key=gemini_api_key),
+            db=self.db,
+            enable_user_memories=True,
+            instructions=self._get_script_instructions(),
             markdown=False,
         )
         
@@ -87,6 +98,7 @@ class ManhwaStoryGenerator:
         Path(OUTPUT_DIR).mkdir(exist_ok=True)
         Path(CHAPTERS_DIR).mkdir(exist_ok=True)
         Path(METADATA_DIR).mkdir(exist_ok=True)
+        Path(SCRIPTS_DIR).mkdir(exist_ok=True)  # New directory
     
     def _get_planner_instructions(self) -> str:
         """Get instructions for story planner agent"""
@@ -125,6 +137,35 @@ Format: Pure story text, end with "📚 CHAPTER LESSONS" section."""
             return base + f"\n\nCUSTOM: {self.custom_instructions}"
         return base
     
+    def _get_script_instructions(self) -> str:
+        """NEW: Get instructions for TTS script generator"""
+        base = """You are an expert audiobook narrator and script adapter.
+
+YOUR TASK: Convert manhwa chapter text into clean, narration-ready script for Text-to-Speech.
+
+CRITICAL RULES:
+1. REMOVE all formatting: **, *, ##, ===, ---
+2. REMOVE all panel/scene markers: (Panel 1), **Scene 2**, etc.
+3. REMOVE all visual descriptions in parentheses
+4. REMOVE caption markers: **CAPTION:**, NARRATOR:
+5. CONVERT character names to speech: "ANYA:" becomes "Anya says:"
+6. EXPAND abbreviations and symbols
+7. KEEP Hindi text as-is (Devanagari)
+8. REMOVE thought bubbles markers, convert to narration
+9. REMOVE all emojis and special symbols
+10. Make it flow naturally as continuous narration
+
+STRUCTURE:
+- Chapter title (spoken)
+- Continuous narrative flow
+- Character dialogues introduced naturally
+- Scene transitions described smoothly
+- Lessons section at end (clearly stated)
+
+OUTPUT: Pure, clean text ready for TTS. No special characters except periods, commas, and Devanagari."""
+        
+        return base
+    
     def _init_tts(self):
         """Initialize Kokoro TTS system"""
         try:
@@ -140,43 +181,30 @@ Format: Pure story text, end with "📚 CHAPTER LESSONS" section."""
     def _extract_json(self, text: str) -> str:
         """Extract and fix JSON from response"""
         text = text.replace("```json", "").replace("```", "").strip()
-        
-        # Fix common JSON formatting issues from AI
-        # Issue 1: Multiple objects without proper array syntax: } { instead of }, {
         text = re.sub(r'\}\s*\{', '}, {', text)
         
-        # Issue 2: Try to find the main JSON structure
-        # Priority: Look for object first (for foundation), then array (for chapters)
-        
-        # Try object first
         object_match = re.search(r'\{[^[]*"series_title"[\s\S]*\}', text)
         if object_match:
-            # This looks like a foundation object
             return object_match.group(0)
         
-        # Try array with chapters
         array_match = re.search(r'\[[^\{]*\{[^[]*"chapter_num"[\s\S]*\]', text)
         if array_match:
             return array_match.group(0)
         
-        # Generic object match
         object_match = re.search(r'\{[\s\S]*\}', text)
         if object_match:
             obj = object_match.group(0)
-            # Check if it needs to be wrapped in array
             if '"chapter_num"' in obj and obj.count('{ "chapter_num"') > 1:
                 if not obj.strip().startswith('['):
                     obj = '[' + obj + ']'
             return obj
         
-        # Generic array match
         array_match = re.search(r'\[[\s\S]*\]', text)
         if array_match:
             return array_match.group(0)
         
         return text
     
-    # STEP 1: Generate Basic Series Info
     def generate_series_foundation(self, skill_topic: str, user_id: str) -> Dict:
         """Generate series title, overview, and characters only"""
         
@@ -210,11 +238,9 @@ NO markdown, NO extra text, ONLY the JSON object."""
         response = self.story_planner.run(prompt, user_id=user_id)
         raw = response.content.strip()
         
-        # Debug output
         with st.expander("🔍 Debug: Foundation Response"):
             st.text_area("Raw Foundation", raw[:1500], height=200)
         
-        # Clean and extract JSON
         clean = self._extract_json(raw)
         
         with st.expander("🔍 Debug: Cleaned Foundation JSON"):
@@ -223,19 +249,16 @@ NO markdown, NO extra text, ONLY the JSON object."""
         try:
             foundation = json.loads(clean)
             
-            # CRITICAL: Validate it's a dictionary, not a list
             if isinstance(foundation, list):
                 st.error("❌ Foundation returned as list instead of object")
                 st.warning("🔄 Attempting to extract first item...")
                 
-                # If it's a list with one object, extract it
                 if len(foundation) > 0 and isinstance(foundation[0], dict):
                     foundation = foundation[0]
                 else:
                     st.error("Cannot recover from list format")
                     return None
             
-            # Validate required keys
             required_keys = ['series_title', 'skill_topic']
             missing = [k for k in required_keys if k not in foundation]
             
@@ -244,7 +267,6 @@ NO markdown, NO extra text, ONLY the JSON object."""
                 st.info(f"Found keys: {list(foundation.keys())}")
                 return None
             
-            # Add defaults for optional keys
             if 'characters' not in foundation:
                 foundation['characters'] = []
             if 'story_overview' not in foundation:
@@ -270,7 +292,6 @@ NO markdown, NO extra text, ONLY the JSON object."""
             st.code(traceback.format_exc())
             return None
     
-    # STEP 2: Generate Chapter Outlines in Batches
     def generate_chapter_batch(
         self, 
         series_foundation: Dict,
@@ -280,7 +301,6 @@ NO markdown, NO extra text, ONLY the JSON object."""
     ) -> List[Dict]:
         """Generate chapter outlines for a specific range"""
         
-        # Validate input
         if not isinstance(series_foundation, dict):
             st.error(f"❌ series_foundation is {type(series_foundation).__name__}, expected dict")
             return []
@@ -303,7 +323,6 @@ NO markdown, NO extra text, ONLY the JSON object."""
                 difficulty = diff
                 break
         
-        # Safely get character names
         char_names = "No characters defined"
         if 'characters' in series_foundation and series_foundation['characters']:
             char_names = ', '.join([c.get('name', 'Unknown') for c in series_foundation['characters'][:5]])
@@ -351,11 +370,9 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
         response = self.story_planner.run(prompt, user_id=user_id)
         raw = response.content.strip()
         
-        # Debug output
         with st.expander(f"🔍 Debug: Chapters {start_chapter}-{end_chapter} Response"):
             st.text_area("Raw", raw[:1000], height=150)
         
-        # Clean and extract JSON
         clean = self._extract_json(raw)
         
         with st.expander(f"🔍 Debug: Cleaned JSON"):
@@ -364,16 +381,13 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
         try:
             chapters = json.loads(clean)
             
-            # Validate it's a list
             if not isinstance(chapters, list):
                 st.error(f"Expected list, got {type(chapters).__name__}")
-                # Try to wrap it
                 if isinstance(chapters, dict) and 'chapter_num' in chapters:
                     chapters = [chapters]
                 else:
                     return []
             
-            # Validate chapter structure
             valid_chapters = []
             for ch in chapters:
                 if isinstance(ch, dict) and 'chapter_num' in ch:
@@ -386,7 +400,6 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
             st.error(f"JSON Error: {e}")
             st.error(f"Position: {e.pos}, Line: {e.lineno}, Column: {e.colno}")
             
-            # Show problematic section
             if e.pos and len(clean) > e.pos:
                 start = max(0, e.pos - 100)
                 end = min(len(clean), e.pos + 100)
@@ -394,7 +407,6 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
             
             return []
     
-    # STEP 3: Combine Everything
     def generate_complete_series(
         self,
         skill_topic: str,
@@ -403,7 +415,6 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
     ) -> Dict:
         """Generate complete 100-chapter series in steps"""
         
-        # Step 1: Foundation
         if progress_callback:
             progress_callback("🎬 Generating series foundation...", 0.1)
         
@@ -413,15 +424,13 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
             st.error("❌ Failed to generate foundation")
             return None
         
-        # Validate foundation is a dict
         if not isinstance(foundation, dict):
             st.error(f"❌ Foundation is {type(foundation).__name__}, expected dict")
             return None
         
         st.success("✅ Foundation created!")
-        st.json(foundation)  # Show the foundation
+        st.json(foundation)
         
-        # Step 2: Generate chapters in batches of 20
         all_chapters = []
         batches = [(1, 20), (21, 40), (41, 60), (61, 80), (81, 100)]
         
@@ -439,20 +448,17 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
                 st.success(f"✅ Batch {idx+1}/5: {len(batch_chapters)} chapters")
             else:
                 st.warning(f"⚠️ Batch {idx+1}/5 failed: Chapters {start}-{end}")
-                # Continue with other batches even if one fails
         
         if not all_chapters:
             st.error("❌ No chapters generated")
             return None
         
-        # Combine everything
         series_data = {
             **foundation,
             "total_chapters": len(all_chapters),
             "chapters": all_chapters
         }
         
-        # Save metadata
         try:
             metadata_file = os.path.join(
                 METADATA_DIR,
@@ -486,7 +492,6 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
             st.error(f"Chapter {chapter_num} not found")
             return None
         
-        # Get context from previous chapters
         prev_context = ""
         if chapter_num > 1:
             prev_chapter = next(
@@ -524,7 +529,6 @@ Write the COMPLETE chapter now:"""
         response = self.chapter_writer.run(prompt, user_id=user_id)
         chapter_content = response.content.strip()
         
-        # Add header
         full_chapter = f"""{'='*60}
 CHAPTER {chapter_num}: {chapter_info['title']}
 Series: {series_data['series_title']}
@@ -539,7 +543,6 @@ End of Chapter {chapter_num}
 {'='*60}
 """
         
-        # Save chapter
         chapter_file = os.path.join(
             CHAPTERS_DIR,
             f"{series_data['skill_topic'].replace(' ', '_')}_ch{chapter_num:03d}.txt"
@@ -549,33 +552,141 @@ End of Chapter {chapter_num}
         
         return full_chapter
     
-    def text_to_speech(self, text: str, output_path: str) -> bool:
-        """Convert text to speech audio"""
+    def generate_tts_script(
+        self,
+        chapter_content: str,
+        chapter_num: int,
+        series_title: str,
+        user_id: str = "default_user",
+        progress_callback=None
+    ) -> str:
+        """NEW: Generate clean TTS-ready script from chapter content"""
+        
+        if progress_callback:
+            progress_callback("🎙️ Converting to TTS script...", 0.0)
+        
+        prompt = f"""Convert this manhwa chapter into a clean audiobook narration script.
+
+CHAPTER CONTENT:
+{chapter_content}
+
+INSTRUCTIONS:
+1. Remove ALL formatting symbols: **, *, ##, ===, ---, ()
+2. Remove panel/scene markers
+3. Convert "CHARACTER:" to "Character says:"
+4. Remove visual descriptions
+5. Keep Hindi text intact
+6. Make it flow naturally for audio
+7. No emojis or special symbols
+8. Expand all abbreviations
+
+OUTPUT: Pure narration text ready for Text-to-Speech."""
+        
+        response = self.script_generator.run(prompt, user_id=user_id)
+        tts_script = response.content.strip()
+        
+        if progress_callback:
+            progress_callback("✅ TTS script generated", 1.0)
+        
+        # Additional cleaning (safety net)
+        tts_script = self._deep_clean_script(tts_script)
+        
+        # Save TTS script
+        script_file = os.path.join(
+            SCRIPTS_DIR,
+            f"tts_script_ch{chapter_num:03d}.txt"
+        )
+        with open(script_file, 'w', encoding='utf-8') as f:
+            f.write(f"Chapter {chapter_num}: {series_title}\n\n{tts_script}")
+        
+        return tts_script
+    
+    def _deep_clean_script(self, text: str) -> str:
+        """Deep clean script for TTS - remove all problematic characters"""
+        
+        # Remove markdown formatting
+        text = re.sub(r'\*\*.*?\*\*', lambda m: m.group(0).replace('**', ''), text)
+        text = re.sub(r'\*.*?\*', lambda m: m.group(0).replace('*', ''), text)
+        text = re.sub(r'##.*?##', lambda m: m.group(0).replace('##', ''), text)
+        
+        # Remove panel/scene markers
+        text = re.sub(r'\(Panel \d+\)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\*\*Scene \d+\*\*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'Scene \d+:', '', text, flags=re.IGNORECASE)
+        
+        # Remove visual descriptions in parentheses
+        text = re.sub(r'\(Visual:.*?\)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\(.*?visual.*?\)', '', text, flags=re.IGNORECASE)
+        
+        # Remove caption markers
+        text = re.sub(r'\*\*CAPTION:\*\*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'NARRATOR:', '', text, flags=re.IGNORECASE)
+        
+        # Clean character dialogue markers
+        text = re.sub(r'([A-Z]+):', r'\1 says:', text)
+        
+        # Remove emojis and special symbols
+        text = re.sub(r'[📚📖✅❌⚠️🎬🎯👥📜🔍💾]', '', text)
+        
+        # Remove extra separators
+        text = re.sub(r'={3,}', '', text)
+        text = re.sub(r'-{3,}', '', text)
+        
+        # Clean whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {2,}', ' ', text)
+        
+        return text.strip()
+    
+    def text_to_speech(
+        self, 
+        text: str, 
+        output_path: str,
+        progress_callback=None
+    ) -> bool:
+        """Convert text to speech audio with progress tracking"""
         if not self.kokoro:
             st.error("TTS not initialized")
             return False
         
         try:
+            if progress_callback:
+                progress_callback("🎵 Converting text to phonemes...", 0.1)
+            
             phonemes, _ = self.g2p(text)
             MAX_PHONEMES = 480
             chunks = [phonemes[i:i + MAX_PHONEMES] for i in range(0, len(phonemes), MAX_PHONEMES)]
             
             all_samples = []
+            total_chunks = len(chunks)
+            
             for idx, chunk in enumerate(chunks):
+                if progress_callback:
+                    progress = 0.1 + (0.8 * (idx + 1) / total_chunks)
+                    progress_callback(f"🎵 Generating audio chunk {idx+1}/{total_chunks}...", progress)
+                
                 samples, sample_rate = self.kokoro.create(
                     chunk, self.voice, self.speed, is_phonemes=True
                 )
                 all_samples.append(samples)
             
+            if progress_callback:
+                progress_callback("💾 Saving audio file...", 0.95)
+            
             full_audio = np.concatenate(all_samples)
             sf.write(output_path, full_audio, sample_rate)
             
             duration = len(full_audio) / sample_rate / 60
-            st.success(f"✅ Audio: {duration:.1f} minutes")
+            
+            if progress_callback:
+                progress_callback(f"✅ Audio complete: {duration:.1f} minutes", 1.0)
+            
             return True
             
         except Exception as e:
-            st.error(f"Audio failed: {e}")
+            st.error(f"Audio generation failed: {e}")
+            import traceback
+            st.error(traceback.format_exc())
             return False
     
     def generate_chapter_with_audio(
@@ -583,20 +694,59 @@ End of Chapter {chapter_num}
         series_data: Dict,
         chapter_num: int,
         user_id: str = "default_user"
-    ) -> tuple:
-        """Generate chapter content AND audio"""
+    ) -> Tuple[str, str, str]:
+        """Generate chapter content, TTS script, AND audio with progress"""
         
+        # Progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        def update_progress(msg: str, progress: float):
+            status_text.text(msg)
+            progress_bar.progress(progress)
+        
+        # Step 1: Generate chapter content
+        update_progress("📝 Generating chapter content...", 0.1)
         chapter_content = self.generate_chapter_content(series_data, chapter_num, user_id)
-        if not chapter_content:
-            return None, None
         
+        if not chapter_content:
+            return None, None, None
+        
+        update_progress("✅ Chapter generated", 0.3)
+        
+        # Step 2: Generate TTS script
+        update_progress("🎙️ Creating TTS narration script...", 0.4)
+        tts_script = self.generate_tts_script(
+            chapter_content,
+            chapter_num,
+            series_data['series_title'],
+            user_id,
+            lambda msg, prog: update_progress(msg, 0.4 + prog * 0.2)
+        )
+        
+        if not tts_script:
+            st.warning("⚠️ TTS script generation failed")
+            return chapter_content, None, None
+        
+        update_progress("✅ TTS script ready", 0.6)
+        
+        # Step 3: Generate audio from TTS script
         audio_file = os.path.join(
             OUTPUT_DIR,
             f"{series_data['skill_topic'].replace(' ', '_')}_ch{chapter_num:03d}.wav"
         )
         
-        success = self.text_to_speech(chapter_content, audio_file)
-        return chapter_content, audio_file if success else None
+        update_progress("🎵 Generating audio...", 0.65)
+        success = self.text_to_speech(
+            tts_script,
+            audio_file,
+            lambda msg, prog: update_progress(msg, 0.65 + prog * 0.35)
+        )
+        
+        progress_bar.progress(1.0)
+        status_text.text("✅ Complete!")
+        
+        return chapter_content, tts_script, audio_file if success else None
 
 
 # Streamlit UI
@@ -608,7 +758,7 @@ def main():
     )
     
     st.title("📚 Educational Manhwa Audiobook Generator")
-    st.markdown("*Multi-step generation for complete 100-chapter series*")
+    st.markdown("*Multi-step generation with clean TTS narration*")
     
     # Sidebar
     with st.sidebar:
@@ -750,7 +900,7 @@ def main():
         st.markdown("---")
         
         # Chapter generation
-        st.header("✍️ Generate Chapters")
+        st.header("✍️ Generate Chapters with Audio")
         
         # Only show if chapters exist
         if not series.get('chapters'):
@@ -769,7 +919,7 @@ def main():
         with col2:
             st.write("")
             st.write("")
-            gen_ch = st.button("📝 Generate", type="primary")
+            gen_ch = st.button("📝 Generate Chapter", type="primary")
         
         with col3:
             st.write("")
@@ -778,48 +928,156 @@ def main():
         
         # Generate single chapter
         if gen_ch:
-            with st.spinner(f"Generating Chapter {chapter_num}..."):
-                content, audio = st.session_state.generator.generate_chapter_with_audio(
+            st.subheader(f"📖 Generating Chapter {chapter_num}")
+            
+            with st.spinner(f"Processing Chapter {chapter_num}..."):
+                content, tts_script, audio = st.session_state.generator.generate_chapter_with_audio(
                     series, chapter_num, "streamlit_user"
                 )
                 
                 if content:
-                    with st.expander(f"📖 Chapter {chapter_num}", expanded=True):
-                        st.text_area("Content", content, height=400)
+                    # Display chapter content
+                    with st.expander(f"📖 Chapter {chapter_num} - Original Manhwa", expanded=False):
+                        st.text_area("Manhwa Content", content, height=400, key=f"content_{chapter_num}")
                     
+                    # Display TTS script
+                    if tts_script:
+                        with st.expander(f"🎙️ Chapter {chapter_num} - TTS Narration Script", expanded=True):
+                            st.text_area("Clean Narration", tts_script, height=400, key=f"script_{chapter_num}")
+                            
+                            # Download TTS script
+                            st.download_button(
+                                "⬇️ Download TTS Script",
+                                tts_script,
+                                file_name=f"tts_script_ch{chapter_num:03d}.txt",
+                                mime="text/plain"
+                            )
+                    
+                    # Display audio
                     if audio and os.path.exists(audio):
+                        st.success("✅ Audio generated successfully!")
                         st.audio(audio)
+                        
                         with open(audio, 'rb') as f:
                             st.download_button(
                                 "⬇️ Download Audio",
                                 f,
-                                file_name=os.path.basename(audio)
+                                file_name=os.path.basename(audio),
+                                mime="audio/wav"
                             )
                     
+                    # Move to next chapter
                     st.session_state.current_chapter = min(chapter_num + 1, len(series['chapters']))
+                    
+                else:
+                    st.error("❌ Chapter generation failed")
         
         # Generate range
         if gen_range:
-            st.subheader("Generate Chapter Range")
+            st.markdown("---")
+            st.subheader("📚 Generate Chapter Range")
+            
             col1, col2, col3 = st.columns(3)
             with col1:
-                start_ch = st.number_input("From", 1, 100, 1)
+                start_ch = st.number_input("From Chapter", 1, 100, 1, key="start_ch")
             with col2:
-                end_ch = st.number_input("To", 1, 100, min(10, len(series['chapters'])))
+                end_ch = st.number_input("To Chapter", 1, 100, min(10, len(series['chapters'])), key="end_ch")
             with col3:
                 st.write("")
                 st.write("")
-                confirm = st.button("✅ Start Batch")
+                confirm = st.button("✅ Start Batch Generation")
             
             if confirm and start_ch <= end_ch:
-                progress_bar = st.progress(0)
+                st.info(f"🚀 Starting batch generation: Chapters {start_ch} to {end_ch}")
+                
+                # Overall progress
+                overall_progress = st.progress(0)
+                overall_status = st.empty()
+                
+                success_count = 0
+                failed_chapters = []
+                
                 for i in range(start_ch, end_ch + 1):
-                    st.info(f"Generating Chapter {i}...")
-                    content, audio = st.session_state.generator.generate_chapter_with_audio(
-                        series, i, "streamlit_user"
+                    overall_status.text(f"📝 Processing Chapter {i} of {end_ch}...")
+                    
+                    # Create expander for this chapter
+                    with st.expander(f"Chapter {i}", expanded=False):
+                        chapter_status = st.empty()
+                        chapter_status.info(f"⏳ Generating Chapter {i}...")
+                        
+                        content, tts_script, audio = st.session_state.generator.generate_chapter_with_audio(
+                            series, i, "streamlit_user"
+                        )
+                        
+                        if content and tts_script:
+                            chapter_status.success(f"✅ Chapter {i} complete!")
+                            success_count += 1
+                            
+                            # Show brief info
+                            st.caption(f"📝 Content: {len(content)} characters")
+                            st.caption(f"🎙️ TTS Script: {len(tts_script)} characters")
+                            if audio and os.path.exists(audio):
+                                st.caption(f"🎵 Audio: {os.path.basename(audio)}")
+                        else:
+                            chapter_status.error(f"❌ Chapter {i} failed")
+                            failed_chapters.append(i)
+                    
+                    # Update overall progress
+                    progress = (i - start_ch + 1) / (end_ch - start_ch + 1)
+                    overall_progress.progress(progress)
+                
+                # Final summary
+                overall_status.empty()
+                overall_progress.progress(1.0)
+                
+                st.markdown("---")
+                st.subheader("📊 Batch Generation Summary")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Chapters", end_ch - start_ch + 1)
+                with col2:
+                    st.metric("Successful", success_count, delta=success_count)
+                with col3:
+                    st.metric("Failed", len(failed_chapters), delta=-len(failed_chapters))
+                
+                if failed_chapters:
+                    st.warning(f"⚠️ Failed chapters: {', '.join(map(str, failed_chapters))}")
+                else:
+                    st.success("🎉 All chapters generated successfully!")
+                    st.balloons()
+        
+        # Additional utilities
+        st.markdown("---")
+        st.subheader("🔧 Utilities")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("📂 View Generated Files"):
+                st.info("**Generated Files:**")
+                st.write(f"📁 Chapters: `{CHAPTERS_DIR}/`")
+                st.write(f"📁 TTS Scripts: `{SCRIPTS_DIR}/`")
+                st.write(f"📁 Audio: `{OUTPUT_DIR}/`")
+                st.write(f"📁 Metadata: `{METADATA_DIR}/`")
+        
+        with col2:
+            if st.button("🔄 Reset Session"):
+                st.session_state.series_data = None
+                st.session_state.current_chapter = 1
+                st.success("✅ Session reset! Generate a new series.")
+                st.rerun()
+        
+        with col3:
+            if st.button("💾 Export Metadata"):
+                if series:
+                    metadata_json = json.dumps(series, ensure_ascii=False, indent=2)
+                    st.download_button(
+                        "⬇️ Download Series Metadata",
+                        metadata_json,
+                        file_name=f"{series.get('skill_topic', 'series').replace(' ', '_')}_metadata.json",
+                        mime="application/json"
                     )
-                    progress_bar.progress((i - start_ch + 1) / (end_ch - start_ch + 1))
-                st.success(f"✅ Generated chapters {start_ch}-{end_ch}!")
 
 
 if __name__ == "__main__":
