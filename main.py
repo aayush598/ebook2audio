@@ -117,7 +117,7 @@ Always output pure JSON starting with { and ending with }."""
         if self.custom_instructions:
             return base + f"\n\nCUSTOM: {self.custom_instructions}"
         return base
-    
+     
     def _get_writer_instructions(self) -> str:
         """Get instructions for chapter writer agent"""
         base = """You are an expert educational manhwa writer.
@@ -139,16 +139,28 @@ Format: Pure story text, end with "📚 CHAPTER LESSONS" section."""
     
     def _get_script_instructions(self) -> str:
         """NEW: Get instructions for TTS script generator"""
-        base = """You are an expert Hindi audiobook narrator and script adapter for Indian audiences.
+        base = """You are an expert audiobook narrator for Indian audiences who speak natural Hinglish.
 
-YOUR TASK: Convert manhwa chapter into clean Hindi narration for Text-to-Speech.
+YOUR TASK: Convert manhwa chapter into clean Hinglish narration for Text-to-Speech.
 
-CRITICAL LANGUAGE RULES:
-1. Write EVERYTHING in Devanagari Hindi (हिंदी)
-2. Use simple, conversational Hindi that common people understand
-3. Only use English words that Indians use daily: mobile, computer, teacher, doctor, strategyetc.
-4. NO complex English phrases
-5. Think: How would someone explain this story to their family in Hindi?
+CRITICAL LANGUAGE RULES - HINGLISH (NATURAL INDIAN STYLE):
+1. Use MIXED Hindi-English like normal Indians talk
+2. Character names in ENGLISH: Anya, Kaito, Seraphina (NOT अन्या, काइटो)
+3. Common English words Indians use daily: mobile, computer, game, city, academy, building, technology, teacher, student, food, water, etc.
+4. Hindi words for actions, feelings, connecting words: था, है, ने कहा, सोचा, देखा, लेकिन, क्योंकि, etc.
+5. Technical terms: Keep simple English OR use common Hindi
+   - "strategy" → "strategy" (Indians understand this)
+   - "resource" → "resources" (commonly used)
+   - "planning" → "planning" (everyday word)
+6. NO शुद्ध हिंदी (pure literary Hindi) that people don't use
+7. Think: How do friends chat on WhatsApp or talk casually?
+
+EXAMPLES OF NATURAL HINGLISH:
+✓ "Anya ने सोचा कि strategy क्या होनी चाहिए"
+✓ "City में technology का जादू था"
+✓ "Kaito ने resources ko distribute किया"
+✓ "Game में sab log nervous थे"
+✗ "अन्या ने योजना के विषय में विचार किया" (too formal/pure)
 
 FORMATTING RULES:
 1. REMOVE all symbols: **, *, ##, ===, ---, (), []
@@ -161,9 +173,9 @@ FORMATTING RULES:
 8. Keep story flowing naturally
 
 STRUCTURE:
-1. Chapter title in Hindi
-2. Complete story without interruption
-3.All lessons at the END only
+1. Chapter title (in Hinglish)
+2. पूरी story without interruption
+3. Lessons at the END only
 
 EXAMPLE CONVERSION:
 Bad: "Anya thought about the strategy for resource allocation"
@@ -171,8 +183,7 @@ Good: "अन्या ने सोचा कि resources को कैसे 
 
 Bad: "**CAPTION:** The city of tomorrow"
 Good: "भविष्य का शहर दिखाई दे रहा था"
-
-OUTPUT: Pure Devanagari Hindi text with some english words which is used in normal conversation, natural flow, lessons at end only."""
+OUTPUT: Natural Hinglish text (देवनागरी script + English names/common words), story first, lessons at end."""
         
         return base
     
@@ -439,7 +450,6 @@ Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
             return None
         
         st.success("✅ Foundation created!")
-        st.json(foundation)
         
         all_chapters = []
         batches = [(1, 20), (21, 40), (41, 60), (61, 80), (81, 100)]
@@ -573,53 +583,61 @@ End of Chapter {chapter_num}
         """NEW: Generate clean TTS-ready script from chapter content"""
         
         if progress_callback:
-            progress_callback("🎙️ हिंदी ऑडियो स्क्रिप्ट बनाई जा रही है...", 0.0)
+            progress_callback("🎙️ Hinglish audio script बनाई जा रही है...", 0.0)
         
-        prompt = f"""इस manhwa अध्याय को साफ हिंदी ऑडियो कहानी में बदलें।
+        prompt = f"""इस manhwa chapter को natural Hinglish audio story में convert करो।
 
-अध्याय सामग्री:
+Chapter Content:
 {chapter_content}
 
-महत्वपूर्ण निर्देश:
+Important Instructions:
 
-1. भाषा:
-   - सब कुछ देवनागरी हिंदी में लिखें with some day to day used english words in english
-   - सरल, बोलचाल की हिंदी का उपयोग करें
-   - केवल रोज़मर्रा के English शब्द: mobile, computer, teacher
+1. LANGUAGE - NATURAL HINGLISH (जैसे लोग बोलते हैं):
+   
+   ✓ Character names: ENGLISH में - Anya, Kaito, Seraphina, Marcus
+   ✓ Common words: mobile, computer, game, city, academy, technology, food, water, strategy, resources, planning
+   ✓ Hindi: था, है, ने कहा, सोचा, देखा, गया, हुआ, लेकिन, और, क्योंकि, कैसे, क्या
+   
+   Examples:
+   ✓ "Anya ने sोचा कि strategy क्या बनानी है"
+   ✓ "City बहुत beautiful थी और technology से भरी थी"
+   ✓ "Kaito ne resources ko carefully distribute किया"
+   ✓ "Game में participants nervous थे"
+   
+   ✗ "अन्या ने योजना बनाने का विचार किया" (बहुत formal)
+   ✗ "नगर अत्यंत सुंदर था" (ऐसे कोई नहीं बोलता)
 
-2. कहानी क्रम:
-   - पहले पूरी कहानी बिना रुकावट के
-   - सभी सबक केवल अंत में "इस अध्याय से सीख" section में
+2. STORY ORDER:
+   - पहले complete story बिना रुकावट के
+   - सभी lessons केवल END में
    - बीच में कोई lesson नहीं
 
-3. साफ करें:
-   - सभी symbols हटाएं: **, *, ##, ===, ---, (), []
-   - Panel/Scene markers हटाएं
-   - Visual descriptions हटाएं
-   - "CHARACTER:" को "Character ने कहा:" में बदलें
-   - Emoji हटाएं
+3. CLEAN करो:
+   - सभी symbols हटाओ: **, *, ##, ===, ---, (), []
+   - Panel/Scene markers हटाओ
+   - Visual descriptions हटाओ
+   - "CHARACTER:" को "Character ने कहा:" में convert करो
+   - Emojis हटाओ
 
-4. प्रवाह:
-   - कहानी स्वाभाविक रूप से बहनी चाहिए
-   - जैसे कोई अपने परिवार को कहानी सुना रहा हो
-   - सरल वाक्य, आसान शब्द
+4. FLOW:
+   - Story natural तरीके से flow होनी चाहिए
+   - जैसे कोई friend को story सुना रहा हो
+   - Simple sentences, आसान language
 
-उदाहरण:
-गलत: "Anya analyzed the complex strategy"
-सही: "अन्या ने सोचा कि क्या strategy बनाई जाए"
+More Examples:
+- "Anya hungry थी और पैसे नहीं थे"
+- "Oracle ने कहा कि tumhe task complete करना होगा"
+- "Settlement में लोगों को food और water चाहिए था"
+- "Kaito methodical approach use कर रहा था"
+- "Seraphina ने Marcus se collaborate किया"
 
-गलत: "The futuristic city with holographic displays"
-सही: "futuristic city जिसमें holographic displays दिख रही थीं"
-
-आउटपुट: Mojority of the text in devnagnri (hindi) with some 
-english words which indians use in day to day life and are 
-aware of that, कहानी पहले, सबक अंत में।"""
+OUTPUT: Natural Hinglish (देवनागरी + English names/common words), story पहले, lessons अंत में।"""
         
         response = self.script_generator.run(prompt, user_id=user_id)
         tts_script = response.content.strip()
         
         if progress_callback:
-            progress_callback("✅ हिंदी स्क्रिप्ट तैयार", 1.0)
+            progress_callback("✅ Hinglish script ready", 1.0)
         
         # Additional cleaning (safety net)
         tts_script = self._deep_clean_script(tts_script)
@@ -633,7 +651,7 @@ aware of that, कहानी पहले, सबक अंत में।"""
             f"tts_script_ch{chapter_num:03d}.txt"
         )
         with open(script_file, 'w', encoding='utf-8') as f:
-            f.write(f"अध्याय {chapter_num}: {series_title}\n\n{tts_script}")
+            f.write(f"Chapter {chapter_num}: {series_title}\n\n{tts_script}")
         
         return tts_script
     
