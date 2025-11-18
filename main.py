@@ -139,30 +139,40 @@ Format: Pure story text, end with "📚 CHAPTER LESSONS" section."""
     
     def _get_script_instructions(self) -> str:
         """NEW: Get instructions for TTS script generator"""
-        base = """You are an expert audiobook narrator and script adapter.
+        base = """You are an expert Hindi audiobook narrator and script adapter for Indian audiences.
 
-YOUR TASK: Convert manhwa chapter text into clean, narration-ready script for Text-to-Speech.
+YOUR TASK: Convert manhwa chapter into clean Hindi narration for Text-to-Speech.
 
-CRITICAL RULES:
-1. REMOVE all formatting: **, *, ##, ===, ---
-2. REMOVE all panel/scene markers: (Panel 1), **Scene 2**, etc.
-3. REMOVE all visual descriptions in parentheses
-4. REMOVE caption markers: **CAPTION:**, NARRATOR:
-5. CONVERT character names to speech: "ANYA:" becomes "Anya says:"
-6. EXPAND abbreviations and symbols
-7. KEEP Hindi text as-is (Devanagari)
-8. REMOVE thought bubbles markers, convert to narration
-9. REMOVE all emojis and special symbols
-10. Make it flow naturally as continuous narration
+CRITICAL LANGUAGE RULES:
+1. Write EVERYTHING in Devanagari Hindi (हिंदी)
+2. Use simple, conversational Hindi that common people understand
+3. Only use English words that Indians use daily: mobile, computer, teacher, doctor, strategyetc.
+4. NO complex English phrases
+5. Think: How would someone explain this story to their family in Hindi?
+
+FORMATTING RULES:
+1. REMOVE all symbols: **, *, ##, ===, ---, (), []
+2. REMOVE panel/scene markers completely
+3. REMOVE visual descriptions
+4. REMOVE caption/narrator labels
+5. Convert "CHARACTER:" to "Character ने कहा:"
+6. REMOVE thought bubble markers
+7. REMOVE all emojis
+8. Keep story flowing naturally
 
 STRUCTURE:
-- Chapter title (spoken)
-- Continuous narrative flow
-- Character dialogues introduced naturally
-- Scene transitions described smoothly
-- Lessons section at end (clearly stated)
+1. Chapter title in Hindi
+2. Complete story without interruption
+3.All lessons at the END only
 
-OUTPUT: Pure, clean text ready for TTS. No special characters except periods, commas, and Devanagari."""
+EXAMPLE CONVERSION:
+Bad: "Anya thought about the strategy for resource allocation"
+Good: "अन्या ने सोचा कि resources को कैसे बांटा जाए"
+
+Bad: "**CAPTION:** The city of tomorrow"
+Good: "भविष्य का शहर दिखाई दे रहा था"
+
+OUTPUT: Pure Devanagari Hindi text with some english words which is used in normal conversation, natural flow, lessons at end only."""
         
         return base
     
@@ -563,33 +573,59 @@ End of Chapter {chapter_num}
         """NEW: Generate clean TTS-ready script from chapter content"""
         
         if progress_callback:
-            progress_callback("🎙️ Converting to TTS script...", 0.0)
+            progress_callback("🎙️ हिंदी ऑडियो स्क्रिप्ट बनाई जा रही है...", 0.0)
         
-        prompt = f"""Convert this manhwa chapter into a clean audiobook narration script.
+        prompt = f"""इस manhwa अध्याय को साफ हिंदी ऑडियो कहानी में बदलें।
 
-CHAPTER CONTENT:
+अध्याय सामग्री:
 {chapter_content}
 
-INSTRUCTIONS:
-1. Remove ALL formatting symbols: **, *, ##, ===, ---, ()
-2. Remove panel/scene markers
-3. Convert "CHARACTER:" to "Character says:"
-4. Remove visual descriptions
-5. Keep Hindi text intact
-6. Make it flow naturally for audio
-7. No emojis or special symbols
-8. Expand all abbreviations
+महत्वपूर्ण निर्देश:
 
-OUTPUT: Pure narration text ready for Text-to-Speech."""
+1. भाषा:
+   - सब कुछ देवनागरी हिंदी में लिखें with some day to day used english words in english
+   - सरल, बोलचाल की हिंदी का उपयोग करें
+   - केवल रोज़मर्रा के English शब्द: mobile, computer, teacher
+
+2. कहानी क्रम:
+   - पहले पूरी कहानी बिना रुकावट के
+   - सभी सबक केवल अंत में "इस अध्याय से सीख" section में
+   - बीच में कोई lesson नहीं
+
+3. साफ करें:
+   - सभी symbols हटाएं: **, *, ##, ===, ---, (), []
+   - Panel/Scene markers हटाएं
+   - Visual descriptions हटाएं
+   - "CHARACTER:" को "Character ने कहा:" में बदलें
+   - Emoji हटाएं
+
+4. प्रवाह:
+   - कहानी स्वाभाविक रूप से बहनी चाहिए
+   - जैसे कोई अपने परिवार को कहानी सुना रहा हो
+   - सरल वाक्य, आसान शब्द
+
+उदाहरण:
+गलत: "Anya analyzed the complex strategy"
+सही: "अन्या ने सोचा कि क्या strategy बनाई जाए"
+
+गलत: "The futuristic city with holographic displays"
+सही: "futuristic city जिसमें holographic displays दिख रही थीं"
+
+आउटपुट: Mojority of the text in devnagnri (hindi) with some 
+english words which indians use in day to day life and are 
+aware of that, कहानी पहले, सबक अंत में।"""
         
         response = self.script_generator.run(prompt, user_id=user_id)
         tts_script = response.content.strip()
         
         if progress_callback:
-            progress_callback("✅ TTS script generated", 1.0)
+            progress_callback("✅ हिंदी स्क्रिप्ट तैयार", 1.0)
         
         # Additional cleaning (safety net)
         tts_script = self._deep_clean_script(tts_script)
+        
+        # Ensure lessons are at the end
+        tts_script = self._move_lessons_to_end(tts_script)
         
         # Save TTS script
         script_file = os.path.join(
@@ -597,7 +633,7 @@ OUTPUT: Pure narration text ready for Text-to-Speech."""
             f"tts_script_ch{chapter_num:03d}.txt"
         )
         with open(script_file, 'w', encoding='utf-8') as f:
-            f.write(f"Chapter {chapter_num}: {series_title}\n\n{tts_script}")
+            f.write(f"अध्याय {chapter_num}: {series_title}\n\n{tts_script}")
         
         return tts_script
     
@@ -611,22 +647,27 @@ OUTPUT: Pure narration text ready for Text-to-Speech."""
         
         # Remove panel/scene markers
         text = re.sub(r'\(Panel \d+\)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\(पैनल \d+\)', '', text)
         text = re.sub(r'\*\*Scene \d+\*\*', '', text, flags=re.IGNORECASE)
         text = re.sub(r'Scene \d+:', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'दृश्य \d+:', '', text)
         
         # Remove visual descriptions in parentheses
         text = re.sub(r'\(Visual:.*?\)', '', text, flags=re.IGNORECASE)
         text = re.sub(r'\(.*?visual.*?\)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\(दृश्य:.*?\)', '', text)
         
         # Remove caption markers
         text = re.sub(r'\*\*CAPTION:\*\*', '', text, flags=re.IGNORECASE)
         text = re.sub(r'NARRATOR:', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'कथावाचक:', '', text)
         
-        # Clean character dialogue markers
-        text = re.sub(r'([A-Z]+):', r'\1 says:', text)
+        # Clean character dialogue markers - keep Hindi style
+        # Don't convert to English "says"
+        text = re.sub(r'([A-Z][A-Z]+):', r'\1 ने कहा:', text)
         
         # Remove emojis and special symbols
-        text = re.sub(r'[📚📖✅❌⚠️🎬🎯👥📜🔍💾]', '', text)
+        text = re.sub(r'[📚📖✅❌⚠️🎬🎯👥📜🔍💾🎙️🎵]', '', text)
         
         # Remove extra separators
         text = re.sub(r'={3,}', '', text)
@@ -635,6 +676,46 @@ OUTPUT: Pure narration text ready for Text-to-Speech."""
         # Clean whitespace
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = re.sub(r' {2,}', ' ', text)
+        
+        return text.strip()
+    
+    def _move_lessons_to_end(self, text: str) -> str:
+        """Move all lesson sections to the end of the script"""
+        
+        # Find all lesson sections (various patterns)
+        lesson_patterns = [
+            r'📚.*?LESSONS.*?\n.*?(?=\n\n|\Z)',
+            r'Lesson \d+:.*?\n.*?(?=\n\n|Lesson|\Z)',
+            r'सबक \d+:.*?\n.*?(?=\n\n|सबक|\Z)',
+            r'इस अध्याय से सीख.*?(?=\n\n|\Z)',
+            r'Chapter.*?Lessons.*?(?=\n\n|\Z)',
+        ]
+        
+        lessons = []
+        for pattern in lesson_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE | re.DOTALL)
+            for match in matches:
+                lesson_text = match.group(0).strip()
+                if lesson_text and len(lesson_text) > 10:  # Avoid false matches
+                    lessons.append(lesson_text)
+                    text = text.replace(match.group(0), '', 1)  # Remove from original position
+        
+        # Clean up the text after removing lessons
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+        
+        # Add all lessons at the end if found
+        if lessons:
+            text += "\n\n" + "="*50 + "\n"
+            text += "इस अध्याय से सीख\n"
+            text += "="*50 + "\n\n"
+            
+            for i, lesson in enumerate(lessons, 1):
+                # Clean the lesson text
+                lesson = re.sub(r'📚|Lesson|सबक', '', lesson, flags=re.IGNORECASE)
+                lesson = re.sub(r'\d+:', '', lesson)
+                lesson = lesson.strip()
+                if lesson:
+                    text += f"{i}. {lesson}\n\n"
         
         return text.strip()
     
