@@ -9,15 +9,12 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
 
 from agno.agent import Agent
 from agno.models.google import Gemini
-# from agno.memory.v2.db.sqlite import SqliteMemoryDb
-# from agno.memory.v2.memory import Memory
-# from agno.storage.sqlite import SqliteStorage
 from agno.db.sqlite import SqliteDb
 
 # Load environment variables
@@ -140,15 +137,19 @@ class HindiManhwaGenerator:
 तुम्हारी जिम्मेदारी:
 - 100 अध्यायों की एक जुड़ी हुई कहानी डिज़ाइन करना
 - यादगार, बेहद स्मार्ट और चालाक किरदार बनाना
+- ऐसी कहानी बनाना जो साज़िशों (Conspiracies), रहस्यों और गहरे बौद्धिक खेल (Intellectual warfare) से भरी हो।
 - हर अध्याय में सस्पेंस और सीख दोनों हों
 - पूरी सीरीज़ में कहानी का प्रवाह बनाए रखना
 - पिछले अध्यायों के संदर्भ को याद रखना
+- कहानी में हर वक्त जान का खतरा और भारी सस्पेंस होना चाहिए।
 
 महत्वपूर्ण नियम:
 1. सिर्फ JSON फॉर्मेट में जवाब दो - कोई markdown नहीं
 2. हर अध्याय पिछले अध्याय से जुड़ा होना चाहिए
 3. किरदार बेहद बुद्धिमान और strategic होने चाहिए
-4. JSON शुरू करो { से या [ से
+4. किरदार: हर पात्र (Character) अपने आप में एक 'Hidden Dragon' हो। कोई भी सीधा-सादा या बेवकूफ न हो। सबकी पर्सनालिटी में सैकड़ों साल का अनुभव (Experienced soul) झलकना चाहिए।
+5. टोन: डार्क, मैच्योर, और फिलॉसॉफिकल
+6. JSON शुरू करो { से या [ से
 
 किरदारों की विशेषताएं:
 - हर किरदार genius level intelligence वाला हो
@@ -157,11 +158,18 @@ class HindiManhwaGenerator:
 - Mind games और strategic thinking दिखाओ"""
     
     def _get_writer_instructions(self) -> str:
-        return """तुम एक हिंदी ऑडियोबुक स्क्रिप्ट राइटर हो - यूट्यूब मानह्वा चैनल्स की तरह।
+        return """तुम एक हिंदी ऑडियोबुक स्क्रिप्ट राइटर हो - यूट्यूब मानह्वा चैनल्स की तरह। 
+        तुम एक हिंदी ऑडियोबुक स्क्रिप्ट राइटर हो, लेकिन तुम्हारी शैली 'Magic Emperor' (Manhwa) जैसी डार्क और भारी होनी चाहिए।
 
 भाषा शैली:
 - आधुनिक, बोलचाल की हिंदी जैसे आज के लोग बोलते हैं
+- Intellectual Depth: किरदार सीधी बात न करें, पहेलियों और दर्शन (Philosophy) में बात करें। हर लाइन का मतलब गहरा हो।
+- हर बातचीत एक युद्ध है। एक किरदार दूसरे को अपनी बातों के जाल में फंसा रहा है।
 - पुराने या पारंपरिक शब्द नहीं, सरल और सीधी भाषा
+- Monologues: मुख्य किरदार अपने मन में गहरी विश्लेषण (Deep Analysis) करे, जैसे वो पूरी दुनिया को पढ़ रहा हो।
+- सबक: अंत में जो सीख हो, वो "नैतिक" न होकर "व्यावहारिक और क्रूर सच्चाई" (Brutal Truth) हो।
+- माहौल हमेशा तनावपूर्ण रखो।
+- पाठक को लगना चाहिए कि हर पल कोई बड़ा राज खुलने वाला है।
 - इंग्लिश नाम और टर्म को देवनागरी में लिखो (मार्कस, स्ट्रैटिजी, ऐकडमी, कमांडर)
 - स्वाभाविक प्रवाह के लिए अल्पविराम (,) का खूब इस्तेमाल करो
 
