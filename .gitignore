@@ -4,5 +4,7 @@ audiobook_output
 temp_chapters
 *.pdf
 *.wav
-manhwa*
+manhwa_*
 tts_scripts
+chapter_context
+*.db
