@@ -1,925 +1,561 @@
 """
-Educational Manhwa-Style Audiobook Generator with TTS Script Generation
-Multi-step generation with clean YouTube-style Hindi narration for audio
+Hindi Educational Manhwa Content Generation Service
+Generates detailed, context-aware Hindi audiobook scripts with natural language
 """
 
 import os
 import json
 import re
+import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import streamlit as st
 from agno.agent import Agent
 from agno.models.google import Gemini
 from agno.db.sqlite import SqliteDb
-from misaki.espeak import EspeakG2P
-from kokoro_onnx import Kokoro
-from huggingface_hub import snapshot_download
-import soundfile as sf
-import numpy as np
 from datetime import datetime
 
 # Configuration
-KOKORO_REPO_ID = "leonelhs/kokoro-thewh1teagle"
-OUTPUT_DIR = "manhwa_audiobooks"
-CHAPTERS_DIR = "manhwa_chapters"
+OUTPUT_DIR = "manhwa_content"
 METADATA_DIR = "manhwa_metadata"
-SCRIPTS_DIR = "tts_scripts"
 
-VOICES = {
-    'Female Alpha': 'hf_alpha',
-    'Female Beta': 'hf_beta',
-    'Male Omega': 'hm_omega',
-    'Male Psi': 'hm_psi'
-}
-
+# Gemini Model Configuration with Rate Limits (Free Tier)
 GEMINI_MODELS = {
-    'Gemini 2.0 Flash Lite': 'gemini-2.0-flash-lite',
-    'Gemini 2.0 Flash': 'gemini-2.0-flash-exp',
-    'Gemini 1.5 Flash': 'gemini-1.5-flash',
-    'Gemini 1.5 Pro': 'gemini-1.5-pro'
+    'Gemini 2.0 Flash': {
+        'id': 'gemini-2.0-flash-exp',
+        'rpm': 15,
+        'tpm': 1_000_000,
+        'rpd': 200,
+        'description': 'Best for detailed content (15 RPM, 1M TPM)'
+    },
+    'Gemini 2.0 Flash Lite': {
+        'id': 'gemini-2.0-flash-lite',
+        'rpm': 30,
+        'tpm': 1_000_000,
+        'rpd': 200,
+        'description': 'Faster generation (30 RPM, 1M TPM)'
+    },
+    'Gemini 2.5 Flash': {
+        'id': 'gemini-2.5-flash',
+        'rpm': 10,
+        'tpm': 250_000,
+        'rpd': 250,
+        'description': 'High quality (10 RPM, 250K TPM)'
+    },
+    'Gemini 2.5 Flash Lite': {
+        'id': 'gemini-2.5-flash-lite',
+        'rpm': 15,
+        'tpm': 250_000,
+        'rpd': 1000,
+        'description': 'Efficient (15 RPM, 250K TPM, 1000 RPD)'
+    }
 }
 
 
-class ManhwaStoryGenerator:
-    """Generates educational manhwa-style stories with TTS-ready scripts"""
+class RateLimiter:
+    """Manages API rate limits"""
+    
+    def __init__(self, rpm: int, tpm: int, rpd: int):
+        self.rpm = rpm  # Requests per minute
+        self.tpm = tpm  # Tokens per minute
+        self.rpd = rpd  # Requests per day
+        
+        self.request_times = []
+        self.daily_requests = 0
+        self.last_reset = datetime.now()
+    
+    def can_make_request(self) -> Tuple[bool, str]:
+        """Check if request can be made"""
+        now = datetime.now()
+        
+        # Reset daily counter
+        if (now - self.last_reset).days >= 1:
+            self.daily_requests = 0
+            self.last_reset = now
+        
+        # Check daily limit
+        if self.daily_requests >= self.rpd:
+            return False, f"Daily limit reached ({self.rpd} requests/day)"
+        
+        # Clean old requests (older than 1 minute)
+        self.request_times = [t for t in self.request_times if (now - t).seconds < 60]
+        
+        # Check per-minute limit
+        if len(self.request_times) >= self.rpm:
+            wait_time = 60 - (now - self.request_times[0]).seconds
+            return False, f"Rate limit: wait {wait_time}s (max {self.rpm} requests/min)"
+        
+        return True, "OK"
+    
+    def record_request(self):
+        """Record a request"""
+        self.request_times.append(datetime.now())
+        self.daily_requests += 1
+    
+    def get_wait_time(self) -> int:
+        """Get seconds to wait before next request"""
+        if not self.request_times:
+            return 0
+        
+        now = datetime.now()
+        oldest = self.request_times[0]
+        elapsed = (now - oldest).seconds
+        
+        if elapsed < 60:
+            return max(0, 60 - elapsed + 1)
+        return 0
+
+
+class HindiManhwaGenerator:
+    """Generates Hindi educational manhwa content with context awareness"""
     
     def __init__(
         self, 
         gemini_api_key: str, 
-        model_id: str = 'gemini-2.0-flash-lite',
-        voice: str = 'hf_alpha',
-        speed: float = 1.0,
-        custom_instructions: str = ""
+        model_choice: str = 'Gemini 2.0 Flash Lite',
+        session_id: str = None
     ):
-        """Initialize the manhwa story generator"""
-        self.model_id = model_id
-        self.voice = voice
-        self.speed = speed
-        self.custom_instructions = custom_instructions
+        """Initialize the generator"""
+        self.model_config = GEMINI_MODELS[model_choice]
+        self.model_id = self.model_config['id']
+        self.session_id = session_id or f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        # Initialize database for memory
-        self.db = SqliteDb(db_file="manhwa_memory.db")
+        # Initialize rate limiter
+        self.rate_limiter = RateLimiter(
+            rpm=self.model_config['rpm'],
+            tpm=self.model_config['tpm'],
+            rpd=self.model_config['rpd']
+        )
         
-        # Initialize Story Planning Agent
+        # Initialize SqliteDb for persistent memory
+        self.db = SqliteDb(
+            session_table="agent_sessions",  # <--- CORRECT PARAMETER
+            memory_table="agent_memories",   # Optional: Good to define since you use memories
+            db_file="manhwa_knowledge.db"
+        )
+        
+        # Initialize Story Planning Agent with memory
         self.story_planner = Agent(
-            name="Manhwa Story Planner",
-            model=Gemini(id=model_id, api_key=gemini_api_key),
+            name="Hindi Manhwa Story Architect",
+            model=Gemini(id=self.model_id, api_key=gemini_api_key),
             db=self.db,
-            enable_user_memories=True,
+            enable_user_memories=True,  # Automatically manage user memories
+            add_history_to_context=True,
+            num_history_runs=10,  # Remember last 10 interactions
             instructions=self._get_planner_instructions(),
             markdown=False,
         )
         
-        # Initialize Chapter Writer Agent
-        self.chapter_writer = Agent(
-            name="Educational Manhwa Writer",
-            model=Gemini(id=model_id, api_key=gemini_api_key),
+        # Initialize Content Writer Agent with memory
+        self.content_writer = Agent(
+            name="Hindi Audiobook Script Writer",
+            model=Gemini(id=self.model_id, api_key=gemini_api_key),
             db=self.db,
             enable_user_memories=True,
+            add_history_to_context=True,
+            num_history_runs=10,
             instructions=self._get_writer_instructions(),
             markdown=False,
         )
         
-        # Initialize TTS Script Generator Agent
-        self.script_generator = Agent(
-            name="TTS Script Generator",
-            model=Gemini(id=model_id, api_key=gemini_api_key),
-            db=self.db,
-            enable_user_memories=True,
-            instructions=self._get_script_instructions(),
-            markdown=False,
-        )
-        
-        # Initialize TTS
-        self._init_tts()
-        
         # Create directories
         Path(OUTPUT_DIR).mkdir(exist_ok=True)
-        Path(CHAPTERS_DIR).mkdir(exist_ok=True)
         Path(METADATA_DIR).mkdir(exist_ok=True)
-        Path(SCRIPTS_DIR).mkdir(exist_ok=True)
+        
+        # Story context tracking
+        self.series_context = None
+        self.chapter_summaries = []
     
     def _get_planner_instructions(self) -> str:
-        """Get instructions for story planner agent"""
-        base = """You are an expert educational manhwa story architect.
+        """Instructions for story planning with context awareness"""
+        return """तुम एक हिंदी शैक्षिक मानह्वा कहानी आर्किटेक्ट हो।
 
-CRITICAL: Return ONLY valid JSON. NO markdown, NO explanations, NO extra text.
+तुम्हारी जिम्मेदारी:
+- 100 अध्यायों की एक जुड़ी हुई कहानी डिज़ाइन करना
+- यादगार किरदार बनाना जिनमें गहराई हो
+- हर अध्याय में सस्पेंस और सीख दोनों हों
+- पूरी सीरीज़ में कहानी का प्रवाह बनाए रखना
+- पिछले अध्यायों के संदर्भ को याद रखना और आगे बढ़ाना
 
-Your role:
-- Design interconnected storylines for skill learning
-- Create memorable characters with depth
-- Build suspenseful narratives with lessons
-- Ensure continuity across all chapters
+महत्वपूर्ण नियम:
+1. सिर्फ JSON फॉर्मेट में जवाब दो - कोई markdown नहीं
+2. हर अध्याय पिछले अध्याय से जुड़ा होना चाहिए
+3. किरदारों का विकास स्वाभाविक होना चाहिए
+4. मुख्य कहानी की दिशा स्थिर रखो
 
-Always output pure JSON starting with { and ending with }."""
-        
-        if self.custom_instructions:
-            return base + f"\n\nCUSTOM: {self.custom_instructions}"
-        return base
-     
+JSON शुरू करो { से और खत्म करो } पर।"""
+    
     def _get_writer_instructions(self) -> str:
-        """Get instructions for chapter writer agent"""
-        base = """You are an expert educational manhwa writer.
+        """Instructions for detailed Hindi content writing"""
+        return """तुम एक हिंदी ऑडियोबुक स्क्रिप्ट राइटर हो - यूट्यूब मानह्वा चैनल्स की तरह।
 
-WRITING STYLE:
-- Hindi (Devanagari: हिंदी) + English mix
-- Hindi for dialogue/narrative, English for technical terms
-- NO Roman transliteration
-- 2500-3500 words per chapter
-- Multiple suspenseful moments
-- 5-8 lessons per chapter
-- Cliffhanger endings
+भाषा शैली:
+- आधुनिक, बोलचाल की हिंदी - जैसे आज के लोग बोलते हैं
+- पुराने या पारंपरिक शब्द नहीं - सरल और सीधी भाषा
+- अंग्रेजी नाम और टर्म को देवनागरी में लिखो (उदाहरण: मार्कस, स्ट्रैटिजी, ऐकडमी)
+- स्वाभाविक प्रवाह के लिए अल्पविराम (,) का खूब इस्तेमाल करो
 
-Format: Pure story text, end with "📚 CHAPTER LESSONS" section."""
+उदाहरण (सही):
+✓ आन्या परेशान थी, उसे समझ नहीं आ रहा था क्या करे।
+✓ कमांडर ने आर्मी को रोका, सबको शांत रहने को कहा।
+✓ पैलेस में अचानक खतरा आया, गार्ड्स भागे लेकिन लेट हो गए।
+
+उदाहरण (गलत):
+✗ आन्या अत्यंत चिंतित थी। (बहुत फॉर्मल)
+✗ Anya was worried. (अंग्रेजी अक्षर)
+✗ आन्या ने strategy को consider किया। (मिक्स भाषा)
+
+लंबाई और विस्तार:
+- हर अध्याय 5000-7000 शब्दों का विस्तृत स्क्रिप्ट
+- कहानी धीरे-धीरे, विस्तार से बताओ
+- हर दृश्य को पूरा खोलो, जल्दबाजी नहीं
+- डायलॉग और एक्शन दोनों में डिटेल दो
+- पात्रों के emotions और thoughts को भी बताओ
+
+क्लीन फॉर्मेट (TTS के लिए):
+- कोई सिंबल नहीं: **, *, ##, ===, (), [], emojis
+- कोई पैनल/सीन मार्कर नहीं
+- डायलॉग: किरदार ने कहा - यह कहा
+- सिर्फ अल्पविराम (,) और पूर्ण विराम (.)
+
+संरचना:
+1. अध्याय शीर्षक (सरल हिंदी में)
+2. विस्तृत कहानी (कोई ब्रेक नहीं, 5000-7000 शब्द)
+3. सबक सेक्शन अंत में (5-8 लाइन, बहुत संक्षिप्त)
+
+सबक फॉर्मेट:
+इस अध्याय से सीख
+1. पहली सीख (एक लाइन)
+2. दूसरी सीख (एक लाइन)
+3. तीसरी सीख (एक लाइन)
+
+याद रखो:
+- पिछले अध्यायों का संदर्भ बनाए रखो
+- किरदारों की consistency रखो
+- मुख्य कहानी की दिशा से मत भटको
+- विस्तार से लिखो लेकिन boring मत बनो
+- हर अध्याय एक cliffhanger पर खत्म हो
+
+सोचो: तुम 15-20 मिनट का ऑडियो स्क्रिप्ट बना रहे हो जो लोग सुनकर मजा लें और सीखें भी।"""
+    
+    def _wait_for_rate_limit(self):
+        """Wait if rate limit is reached"""
+        can_request, message = self.rate_limiter.can_make_request()
         
-        if self.custom_instructions:
-            return base + f"\n\nCUSTOM: {self.custom_instructions}"
-        return base
-    
-    def _get_script_instructions(self) -> str:
-        """Get instructions for TTS script generator - YouTube style"""
-        base = """आप एक यूट्यूब पर हिंदी मानह्वा स्टोरीटेलर हैं, जैसे ऐनिमे सम्राट, ऐनिमे एक्सप्लेन, या हिंदी माँगा एक्सप्लेनड चैनल्स.
-
-        आपका स्टाइल: यूट्यूबर्स द्वारा मानह्वा/ऐनिमे कहानियों को समझाते हुए एक नैचुरल, इंप्रेसिव हिंदी नैरेटर. कहानी सुनाने का फ्लो तेज और रिदमिक होना चाहिए.
-
-        भाषा नियम (यूट्यूब स्टाइल):
-        1. पूरी तरह हिंदी: सरल, बोलचाल वाली हिंदी का प्रयोग करें जो यूट्यूबर्स इस्तेमाल करते हैं. कोई भी अंग्रेजी अक्षर (A-Z) इस्तेमाल नहीं करना है.
-        2. ट्रांसक्राइब्ड इंग्लिश शब्द: अगर कोई नाम, टाइटल या टेक्निकल टर्म इंग्लिश में है, तो उसे देवनागरी (हिंदी) लिपि में लिखें ताकि वह हिंदी बोलने के लहजे में उच्चारित हो.
-        - कैरेक्टर नेम्स: आन्या, काइटो, ज़ारा, पेट्रोवा
-        - रैंक्स/टाइटल्स: प्रोफेसर वान्स, गार्ड, रोबोट, ऐकडमी
-        - टेक्निकल टर्म्स: स्ट्रैटिजी, रिसोर्सेस, एन्वायरनमेंट, ऑब्जेक्टिव
-        - उच्चारण टिप: इन शब्दों को हिंदी बोलने के लहजे में ही लिखें (उदाहरण: 'स्ट्रैटिजी' की तरह).
-        3. कनेक्टिंग वर्ड्स: फिर, लेकिन, और, तो, अचानक, इसलिए, हालाँकि, ताकि.
-        4. प्रवाह और विराम (फ्लो और पॉज़) सबसे ज़रूरी:
-        - छोटे, प्राकृतिक ब्रेक और लय (रिदम) के लिए अल्पविराम (,) का प्रयोग करें.
-        - बड़े विराम और वाक्यों के अंत के लिए पूर्ण विराम (.) का प्रयोग करें. **महत्वपूर्ण: टीटीएस को गति और लय बेहतर बनाने के लिए अल्पविराम (,) का अधिक प्रयोग करें. पूर्ण विराम (.) का उच्चारण नहीं होना चाहिए.**
-
-        उदाहरण (यूट्यूब नैरेटर स्टाइल):
-        ✓ आन्या बहुत परेशान थी, और उसे समझ नहीं आ रहा था कि क्या करे. (फ्लो के लिए अल्पविराम जोड़े गए)
-        ✓ प्रोफेसर वान्स ने कहा - आपका स्वागत है, मिस पेट्रोवा.
-        ✓ पैलेस में अचानक खतरा आ गया, गार्ड्स भागे लेकिन लेट हो गए.
-
-        क्लीन आउटपुट नियम:
-        1. कोई विशेष वर्ण नहीं: कोई भी सिंबल, आइकॉन, स्पेशल कैरेक्टर (** , *, ##, ===, ---, (), [], emojis) का इस्तेमाल न करें, केवल हिंदी वर्ण और punctuation marks (, .) का प्रयोग करें.
-        2. कोई सीन मार्कर नहीं: (पैनल 1), सीन 2, दृश्य, या किसी भी प्रकार के विजुअल डिस्क्रिप्शन.
-        3. सिंपल डायलॉग: कैरेक्टर ने कहा - डायलॉग यहाँ (इसे छोटा और सीधा रखें)
-        4. वाक्य छोटे, स्पष्ट, और लयबद्ध (रिदमिक) होने चाहिए.
-
-        संरचना:
-        - चैप्टर टाइटल सरल हिंदी में.
-        - कहानी पूरी बिना किसी अनावश्यक ब्रेक के.
-        - लेसन्स सेक्शन एकदम अंत में.
-
-        सोचें: आप हिंदी दर्शकों को एक मानह्वा चैप्टर समझाते हुए एक यूट्यूब वीडियो रिकॉर्ड कर रहे हैं. कहानी को आकर्षक, भावनात्मक रूप से सही और फॉलो करने में बहुत आसान रखें!
-
-        फाइनल आउटपुट: पूरी तरह से देवनागरी (हिंदी) लिपि में साफ पाठ, कोई विशेष फॉर्मेटिंग नहीं, अल्पविराम (,) का उचित उपयोग, और स्वाभाविक कहानी कहने का प्रवाह. **पूरा आउटपुट केवल हिंदी वर्णों में होना चाहिए. टीटीएस को किसी भी हाल में पूर्ण विराम (fullstop) का उच्चारण नहीं करना है.**"""
-        return base
-    
-    def _init_tts(self):
-        """Initialize Kokoro TTS system"""
-        try:
-            snapshot = snapshot_download(repo_id=KOKORO_REPO_ID)
-            self.g2p = EspeakG2P(language="hi")
-            model_path = os.path.join(snapshot, "kokoro-v1.0.onnx")
-            voices_path = os.path.join(snapshot, "voices-v1.0.bin")
-            self.kokoro = Kokoro(model_path, voices_path)
-        except Exception as e:
-            st.warning(f"TTS not available: {e}")
-            self.kokoro = None
+        if not can_request:
+            wait_time = self.rate_limiter.get_wait_time()
+            if wait_time > 0:
+                st.warning(f"⏳ {message}")
+                progress_bar = st.progress(0)
+                for i in range(wait_time):
+                    progress_bar.progress((i + 1) / wait_time)
+                    time.sleep(1)
+                progress_bar.empty()
     
     def _extract_json(self, text: str) -> str:
-        """Extract and fix JSON from response"""
+        """Extract clean JSON from response"""
         text = text.replace("```json", "").replace("```", "").strip()
-        text = re.sub(r'\}\s*\{', '}, {', text)
         
-        object_match = re.search(r'\{[^[]*"series_title"[\s\S]*\}', text)
+        # Try to find JSON object
+        object_match = re.search(r'\{[\s\S]*\}', text)
         if object_match:
             return object_match.group(0)
         
-        array_match = re.search(r'\[[^\{]*\{[^[]*"chapter_num"[\s\S]*\]', text)
-        if array_match:
-            return array_match.group(0)
-        
-        object_match = re.search(r'\{[\s\S]*\}', text)
-        if object_match:
-            obj = object_match.group(0)
-            if '"chapter_num"' in obj and obj.count('{ "chapter_num"') > 1:
-                if not obj.strip().startswith('['):
-                    obj = '[' + obj + ']'
-            return obj
-        
+        # Try to find JSON array
         array_match = re.search(r'\[[\s\S]*\]', text)
         if array_match:
             return array_match.group(0)
         
         return text
     
-    def generate_series_foundation(self, skill_topic: str, user_id: str) -> Dict:
-        """Generate series title, overview, and characters only"""
+    def generate_series_foundation(self, skill_topic: str) -> Dict:
+        """Generate series foundation with characters and plot"""
         
-        prompt = f"""Create foundation for a 100-chapter educational manhwa about: {skill_topic}
+        self._wait_for_rate_limit()
+        
+        # Use session_id as user_id for context tracking
+        user_id = self.session_id
+        
+        prompt = f"""विषय "{skill_topic}" पर 100 अध्यायों की शैक्षिक मानह्वा सीरीज़ का फाउंडेशन बनाओ।
 
-CRITICAL: Return ONLY a JSON object (not an array). Start with {{ and end with }}.
+महत्वपूर्ण: सिर्फ JSON ऑब्जेक्ट return करो (array नहीं)।
 
 {{
-    "series_title": "Creative Series Title",
+    "series_title": "रोमांचक सीरीज़ का नाम",
     "skill_topic": "{skill_topic}",
-    "story_overview": "Write a 500-word story synopsis covering: setting, main conflict, character arcs, how skills are taught, major plot twists, character growth, and how chapters interconnect.",
+    "story_overview": "500 शब्दों में पूरी कहानी का synopsis: setting, main conflict, character arcs, कैसे सिखाया जाएगा, major plot twists, character growth, कैसे अध्याय जुड़े हैं।",
+    "main_storyline": "मुख्य कहानी की दिशा जो 100 अध्यायों में फॉलो होगी",
+    "world_setting": "कहानी की दुनिया का विवरण",
+    "central_conflict": "मुख्य संघर्ष जो पूरी सीरीज़ में चलेगा",
     "characters": [
         {{
-            "name": "Character Name",
-            "role": "Role in story",
-            "personality": "Personality traits",
-            "background": "Background story"
-        }},
-        {{
-            "name": "Another Character",
-            "role": "Role",
-            "personality": "Traits",
-            "background": "Story"
+            "name": "किरदार का नाम",
+            "role": "कहानी में भूमिका",
+            "personality": "स्वभाव की विशेषताएं",
+            "background": "पृष्ठभूमि की कहानी",
+            "character_arc": "पूरी सीरीज़ में कैसे बदलेगा"
         }}
     ]
 }}
 
-Include 5-7 diverse characters representing different aspects of {skill_topic}.
-NO markdown, NO extra text, ONLY the JSON object."""
+5-7 विविध किरदार बनाओ जो {skill_topic} के अलग पहलुओं को represent करें।
+कोई markdown नहीं, सिर्फ JSON ऑब्जेक्ट।"""
         
-        response = self.story_planner.run(prompt, user_id=user_id)
+        response = self.story_planner.run(prompt, stream=False, user_id=user_id)
+        self.rate_limiter.record_request()
+        
         raw = response.content.strip()
-        
-        with st.expander("🔍 Debug: Foundation Response"):
-            st.text_area("Raw Foundation", raw[:1500], height=200)
-        
         clean = self._extract_json(raw)
-        
-        with st.expander("🔍 Debug: Cleaned Foundation JSON"):
-            st.text_area("Cleaned", clean[:1500], height=200)
         
         try:
             foundation = json.loads(clean)
             
-            if isinstance(foundation, list):
-                st.error("❌ Foundation returned as list instead of object")
-                st.warning("🔄 Attempting to extract first item...")
-                
-                if len(foundation) > 0 and isinstance(foundation[0], dict):
-                    foundation = foundation[0]
-                else:
-                    st.error("Cannot recover from list format")
-                    return None
+            if isinstance(foundation, list) and len(foundation) > 0:
+                foundation = foundation[0]
             
-            required_keys = ['series_title', 'skill_topic']
-            missing = [k for k in required_keys if k not in foundation]
+            # Store in context
+            self.series_context = foundation
             
-            if missing:
-                st.error(f"❌ Missing keys: {', '.join(missing)}")
-                st.info(f"Found keys: {list(foundation.keys())}")
-                return None
+            # Save to file
+            self._save_metadata(foundation, "series_foundation")
             
-            if 'characters' not in foundation:
-                foundation['characters'] = []
-            if 'story_overview' not in foundation:
-                foundation['story_overview'] = f"Educational manhwa series about {skill_topic}"
-            
-            st.success("✅ Foundation parsed successfully")
+            st.success("✅ सीरीज़ की नींव तैयार!")
             return foundation
             
         except json.JSONDecodeError as e:
             st.error(f"❌ JSON Parse Error: {e}")
-            st.error(f"Line {e.lineno}, Column {e.colno}, Position {e.pos}")
-            
-            if e.pos and len(clean) > e.pos:
-                start = max(0, e.pos - 150)
-                end = min(len(clean), e.pos + 150)
-                st.code(clean[start:end])
-            
-            return None
-        
-        except Exception as e:
-            st.error(f"❌ Unexpected error: {e}")
-            import traceback
-            st.code(traceback.format_exc())
             return None
     
-    def generate_chapter_batch(
-        self, 
-        series_foundation: Dict,
-        start_chapter: int,
-        end_chapter: int,
-        user_id: str
-    ) -> List[Dict]:
-        """Generate chapter outlines for a specific range"""
-        
-        if not isinstance(series_foundation, dict):
-            st.error(f"❌ series_foundation is {type(series_foundation).__name__}, expected dict")
-            return []
-        
-        if 'series_title' not in series_foundation:
-            st.error("❌ series_foundation missing 'series_title'")
-            st.json(series_foundation)
-            return []
-        
-        difficulty_map = {
-            (1, 20): "Beginner",
-            (21, 50): "Intermediate", 
-            (51, 75): "Advanced",
-            (76, 100): "Expert"
-        }
-        
-        difficulty = "Intermediate"
-        for (s, e), diff in difficulty_map.items():
-            if start_chapter >= s and start_chapter <= e:
-                difficulty = diff
-                break
-        
-        char_names = "No characters defined"
-        if 'characters' in series_foundation and series_foundation['characters']:
-            char_names = ', '.join([c.get('name', 'Unknown') for c in series_foundation['characters'][:5]])
-        
-        prompt = f"""Generate chapter outlines {start_chapter} to {end_chapter} for: {series_foundation['series_title']}
-
-SERIES CONTEXT:
-Skill: {series_foundation.get('skill_topic', 'strategic thinking')}
-Overview: {series_foundation.get('story_overview', '')[:500]}...
-
-Characters: {char_names}
-
-REQUIREMENTS:
-- Chapters {start_chapter}-{end_chapter}
-- Difficulty level: {difficulty}
-- Progressive skill building
-- Interconnected plot
-- Each chapter has cliffhanger leading to next
-
-CRITICAL: Return ONLY a JSON array starting with [ and ending with ]. NO other text.
-
-[
-    {{
-        "chapter_num": {start_chapter},
-        "title": "Lesson-Based Title",
-        "lesson_focus": "Main skills taught (2-3 sentences)",
-        "plot_summary": "Key plot events (3-4 sentences)",
-        "character_focus": "Character development moment",
-        "cliffhanger": "Hook for next chapter",
-        "difficulty": "{difficulty}"
-    }},
-    {{
-        "chapter_num": {start_chapter + 1},
-        "title": "Next Chapter Title",
-        "lesson_focus": "...",
-        "plot_summary": "...",
-        "character_focus": "...",
-        "cliffhanger": "...",
-        "difficulty": "{difficulty}"
-    }}
-]
-
-Generate ALL {end_chapter - start_chapter + 1} chapters in this exact format."""
-        
-        response = self.story_planner.run(prompt, user_id=user_id)
-        raw = response.content.strip()
-        
-        with st.expander(f"🔍 Debug: Chapters {start_chapter}-{end_chapter} Response"):
-            st.text_area("Raw", raw[:1000], height=150)
-        
-        clean = self._extract_json(raw)
-        
-        with st.expander(f"🔍 Debug: Cleaned JSON"):
-            st.text_area("Cleaned", clean[:1000], height=150)
-        
-        try:
-            chapters = json.loads(clean)
-            
-            if not isinstance(chapters, list):
-                st.error(f"Expected list, got {type(chapters).__name__}")
-                if isinstance(chapters, dict) and 'chapter_num' in chapters:
-                    chapters = [chapters]
-                else:
-                    return []
-            
-            valid_chapters = []
-            for ch in chapters:
-                if isinstance(ch, dict) and 'chapter_num' in ch:
-                    valid_chapters.append(ch)
-            
-            st.success(f"✅ Parsed {len(valid_chapters)} chapters")
-            return valid_chapters
-            
-        except json.JSONDecodeError as e:
-            st.error(f"JSON Error: {e}")
-            st.error(f"Position: {e.pos}, Line: {e.lineno}, Column: {e.colno}")
-            
-            if e.pos and len(clean) > e.pos:
-                start = max(0, e.pos - 100)
-                end = min(len(clean), e.pos + 100)
-                st.code(clean[start:end])
-            
-            return []
-    
-    def generate_complete_series(
+    def generate_chapter_outline(
         self,
-        skill_topic: str,
-        user_id: str = "default_user",
-        progress_callback=None
+        chapter_num: int,
+        series_foundation: Dict
     ) -> Dict:
-        """Generate complete 100-chapter series in steps"""
+        """Generate single chapter outline with full context"""
         
-        if progress_callback:
-            progress_callback("🎬 Generating series foundation...", 0.1)
+        self._wait_for_rate_limit()
         
-        foundation = self.generate_series_foundation(skill_topic, user_id)
+        user_id = self.session_id
         
-        if not foundation:
-            st.error("❌ Failed to generate foundation")
-            return None
+        # Get previous chapter context
+        prev_context = ""
+        if chapter_num > 1 and self.chapter_summaries:
+            prev_chapter = self.chapter_summaries[-1]
+            prev_context = f"""
+पिछला अध्याय (Chapter {chapter_num - 1}):
+शीर्षक: {prev_chapter.get('title', '')}
+सारांश: {prev_chapter.get('summary', '')}
+अंत: {prev_chapter.get('ending', '')}
+"""
         
-        if not isinstance(foundation, dict):
-            st.error(f"❌ Foundation is {type(foundation).__name__}, expected dict")
-            return None
+        # Determine difficulty
+        difficulty = "शुरुआती" if chapter_num <= 20 else "मध्यम" if chapter_num <= 50 else "उन्नत" if chapter_num <= 75 else "विशेषज्ञ"
         
-        st.success("✅ Foundation created!")
+        prompt = f"""सीरीज़ "{series_foundation['series_title']}" का अध्याय {chapter_num} का outline बनाओ।
+
+सीरीज़ संदर्भ:
+- मुख्य कहानी: {series_foundation.get('main_storyline', '')}
+- केंद्रीय संघर्ष: {series_foundation.get('central_conflict', '')}
+- दुनिया: {series_foundation.get('world_setting', '')}
+{prev_context}
+
+किरदार: {', '.join([c['name'] + ' (' + c['role'] + ')' for c in series_foundation.get('characters', [])])}
+
+JSON format में return करो:
+{{
+    "chapter_num": {chapter_num},
+    "title": "सबक-आधारित शीर्षक",
+    "lesson_focus": "इस अध्याय में मुख्य सीख (2-3 वाक्य)",
+    "plot_summary": "मुख्य घटनाएं (4-5 वाक्य, बहुत विस्तार से)",
+    "character_focus": "किस किरदार का विकास होगा",
+    "key_scenes": "3-4 महत्वपूर्ण दृश्य",
+    "cliffhanger": "अगले अध्याय के लिए hook",
+    "difficulty": "{difficulty}",
+    "connection_to_previous": "पिछले अध्याय से कैसे जुड़ा है"
+}}
+
+सिर्फ JSON ऑब्जेक्ट return करो।"""
         
-        all_chapters = []
-        batches = [(1, 20), (21, 40), (41, 60), (61, 80), (81, 100)]
+        response = self.story_planner.run(prompt, stream=False, user_id=user_id)
+        self.rate_limiter.record_request()
         
-        for idx, (start, end) in enumerate(batches):
-            if progress_callback:
-                progress = 0.1 + (0.8 * (idx + 1) / len(batches))
-                progress_callback(f"📚 Generating chapters {start}-{end}...", progress)
-            
-            batch_chapters = self.generate_chapter_batch(
-                foundation, start, end, user_id
-            )
-            
-            if batch_chapters:
-                all_chapters.extend(batch_chapters)
-                st.success(f"✅ Batch {idx+1}/5: {len(batch_chapters)} chapters")
-            else:
-                st.warning(f"⚠️ Batch {idx+1}/5 failed: Chapters {start}-{end}")
-        
-        if not all_chapters:
-            st.error("❌ No chapters generated")
-            return None
-        
-        series_data = {
-            **foundation,
-            "total_chapters": len(all_chapters),
-            "chapters": all_chapters
-        }
+        clean = self._extract_json(response.content.strip())
         
         try:
-            metadata_file = os.path.join(
-                METADATA_DIR,
-                f"{skill_topic.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            )
-            with open(metadata_file, 'w', encoding='utf-8') as f:
-                json.dump(series_data, f, ensure_ascii=False, indent=2)
-            st.info(f"💾 Saved to: {metadata_file}")
-        except Exception as e:
-            st.warning(f"⚠️ Could not save metadata: {e}")
-        
-        if progress_callback:
-            progress_callback("✅ Series complete!", 1.0)
-        
-        return series_data
+            outline = json.loads(clean)
+            return outline
+        except:
+            return None
     
     def generate_chapter_content(
         self,
-        series_data: Dict,
         chapter_num: int,
-        user_id: str = "default_user"
+        chapter_outline: Dict,
+        series_foundation: Dict
     ) -> str:
-        """Generate full chapter content with story and lessons"""
+        """Generate detailed TTS-ready Hindi script (5000-7000 words)"""
         
-        chapter_info = next(
-            (ch for ch in series_data['chapters'] if ch['chapter_num'] == chapter_num),
-            None
-        )
+        self._wait_for_rate_limit()
         
-        if not chapter_info:
-            st.error(f"Chapter {chapter_num} not found")
-            return None
+        user_id = self.session_id
         
+        # Build context from previous chapters
         prev_context = ""
-        if chapter_num > 1:
-            prev_chapter = next(
-                (ch for ch in series_data['chapters'] if ch['chapter_num'] == chapter_num - 1),
-                None
-            )
-            if prev_chapter:
-                prev_context = f"\n\nPREVIOUS CHAPTER:\nChapter {chapter_num-1}: {prev_chapter['title']}\n{prev_chapter['plot_summary']}\nEnded with: {prev_chapter['cliffhanger']}"
+        if self.chapter_summaries:
+            recent_summaries = self.chapter_summaries[-3:]  # Last 3 chapters
+            prev_context = "\n\nपिछले अध्यायों का सारांश:\n"
+            for summary in recent_summaries:
+                prev_context += f"अध्याय {summary['chapter_num']}: {summary['summary']}\n"
         
-        prompt = f"""Write complete Chapter {chapter_num} for: {series_data['series_title']}
+        prompt = f"""अध्याय {chapter_num} का पूरा TTS-ready Hindi script लिखो।
 
-SERIES: {series_data['story_overview'][:300]}...
-
-CHARACTERS: {', '.join([f"{c['name']} ({c['role']})" for c in series_data['characters'][:5]])}
+सीरीज़: {series_foundation['series_title']}
+मुख्य कहानी: {series_foundation.get('main_storyline', '')}
+किरदार: {', '.join([f"{c['name']} ({c['role']})" for c in series_foundation.get('characters', [])])}
 {prev_context}
 
-THIS CHAPTER:
-Title: {chapter_info['title']}
-Focus: {chapter_info['lesson_focus']}
-Plot: {chapter_info['plot_summary']}
-Character: {chapter_info['character_focus']}
-Ending: {chapter_info['cliffhanger']}
+इस अध्याय की जानकारी:
+- शीर्षक: {chapter_outline['title']}
+- सीख: {chapter_outline['lesson_focus']}
+- कहानी: {chapter_outline['plot_summary']}
+- दृश्य: {chapter_outline.get('key_scenes', '')}
+- किरदार फोकस: {chapter_outline['character_focus']}
+- अंत: {chapter_outline['cliffhanger']}
+- पिछले से जुड़ाव: {chapter_outline.get('connection_to_previous', '')}
 
-WRITE:
-- 2500-3500 words
-- Hindi (हिंदी) + English mix
-- Multiple suspenseful moments
-- 5-8 lessons through actions
-- Visual manhwa-style scenes
-- Build to cliffhanger
-- End with "📚 CHAPTER {chapter_num} LESSONS" section listing key takeaways
+महत्वपूर्ण निर्देश:
+1. 5000-7000 शब्दों का विस्तृत script (15-20 मिनट audio के लिए)
+2. बोलचाल की आधुनिक हिंदी - पुराने शब्द नहीं
+3. अंग्रेजी नाम/टर्म को देवनागरी में (मार्कस, स्ट्रैटिजी)
+4. प्रवाह के लिए अल्पविराम (,) का खूब इस्तेमाल
+5. हर दृश्य को विस्तार से बताओ - जल्दबाजी नहीं
+6. किरदारों के emotions, thoughts को भी बताओ
+7. कोई सिंबल नहीं (**, *, ##, (), [])
+8. सिर्फ साफ देवनागरी text
+9. सबक अंत में (5-8 लाइन, बहुत संक्षिप्त)
 
-Write the COMPLETE chapter now:"""
-        
-        response = self.chapter_writer.run(prompt, user_id=user_id)
-        chapter_content = response.content.strip()
-        
-        full_chapter = f"""{'='*60}
-CHAPTER {chapter_num}: {chapter_info['title']}
-Series: {series_data['series_title']}
-Skill: {series_data['skill_topic']} | Difficulty: {chapter_info['difficulty']}
-{'='*60}
+फॉर्मेट:
+अध्याय {chapter_num}: {chapter_outline['title']}
 
-{chapter_content}
+[यहाँ 5000-7000 शब्दों की विस्तृत कहानी लिखो]
 
-{'='*60}
-End of Chapter {chapter_num}
-{f"Next: Chapter {chapter_num + 1}" if chapter_num < len(series_data['chapters']) else "Series Complete"}
-{'='*60}
-"""
+इस अध्याय से सीख
+1. पहली सीख (एक लाइन)
+2. दूसरी सीख (एक लाइन)
+...
+
+अब पूरा अध्याय लिखो - विस्तृत, रोचक, और TTS के लिए एकदम साफ।"""
         
-        chapter_file = os.path.join(
-            CHAPTERS_DIR,
-            f"{series_data['skill_topic'].replace(' ', '_')}_ch{chapter_num:03d}.txt"
-        )
-        with open(chapter_file, 'w', encoding='utf-8') as f:
-            f.write(full_chapter)
+        response = self.content_writer.run(prompt, stream=False, user_id=user_id)
+        self.rate_limiter.record_request()
         
-        return full_chapter
+        content = response.content.strip()
+        
+        # Deep clean for TTS
+        content = self._deep_clean_for_tts(content)
+        
+        # Store chapter summary for context
+        self.chapter_summaries.append({
+            'chapter_num': chapter_num,
+            'title': chapter_outline['title'],
+            'summary': chapter_outline['plot_summary'],
+            'ending': chapter_outline['cliffhanger']
+        })
+        
+        return content
     
-    def generate_tts_script(
-        self,
-        chapter_content: str,
-        chapter_num: int,
-        series_title: str,
-        user_id: str = "default_user",
-        progress_callback=None
-    ) -> str:
-        """Generate clean TTS-ready script from chapter content"""
+    def _deep_clean_for_tts(self, text: str) -> str:
+        """Deep cleaning for TTS compatibility"""
         
-        if progress_callback:
-            progress_callback("🎙️ Creating YouTube-style narration...", 0.0)
+        # Remove ALL markdown
+        text = re.sub(r'\*+', '', text)
+        text = re.sub(r'#+', '', text)
+        text = re.sub(r'_+', '', text)
+        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
         
-        prompt = f"""तुम एक Hindi YouTube manhwa narrator हो। इस chapter को simple Hindi में explain करो - जैसे तुम video में story सुना रहे हो।
-
-Chapter Content:
-{chapter_content}
-
-NARRATION STYLE (YouTube Explainer):
-
-1. **LANGUAGE - Simple Hindi + English names**:
-   ✓ "Anya बहुत चिंतित थी। उसे समझ नहीं आ रहा था।"
-   ✓ "Commander ने army को आदेश दिया - रुको यहीं!"
-   ✓ "Palace में अचानक खतरा आ गया।"
-   ✓ "Marcus की strategy बिल्कुल अलग थी।"
-   
-   ✗ "Anya ने strategy ko consider किया" (too much English mixing)
-   ✗ "अन्या अत्यंत चिंतित थी" (too formal)
-
-2. **English sirf yaha use karo**:
-   - Names: Anya, Kaito, Marcus, Seraphina
-   - Titles: Commander, Prince, Emperor, Guard
-   - Common terms: army, palace, strategy, resources
-
-3. **CLEAN FORMAT**:
-   - NO symbols: **, *, ##, ===, (), []
-   - NO scene markers
-   - NO visual descriptions
-   - Dialogue: "Character ने कहा - dialogue"
-   - Short, clear sentences
-
-4. **STRUCTURE**:
-   - Chapter title
-   - Pure story (no breaks)
-   - Lessons at END only
-
-THINK: तुम YouTube video record कर रहे हो। Simple Hindi बोलो, natural flow रखो।
-
-OUTPUT: साफ Hindi text, English names के साथ, बिना special characters के।"""
+        # Remove brackets
+        text = re.sub(r'\[.*?\]', '', text)
+        text = re.sub(r'\(.*?\)', '', text)
+        text = re.sub(r'\{.*?\}', '', text)
         
-        response = self.script_generator.run(prompt, user_id=user_id)
-        tts_script = response.content.strip()
+        # Remove scene markers
+        text = re.sub(r'(?i)(panel|scene|दृश्य|पैनल)\s*\d+', '', text)
+        text = re.sub(r'(?i)(visual|caption|narrator|कथावाचक):', '', text)
         
-        if progress_callback:
-            progress_callback("🧹 Deep cleaning script...", 0.6)
-        
-        # Deep cleaning (safety net)
-        tts_script = self._deep_clean_script(tts_script)
-        
-        if progress_callback:
-            progress_callback("📝 Organizing content...", 0.8)
-        
-        # Ensure lessons are at the end
-        tts_script = self._move_lessons_to_end(tts_script)
-        
-        # Final validation and fixes
-        tts_script = self._final_tts_validation(tts_script)
-        
-        if progress_callback:
-            progress_callback("✅ TTS script ready!", 1.0)
-        
-        # Save TTS script
-        script_file = os.path.join(
-            SCRIPTS_DIR,
-            f"tts_script_ch{chapter_num:03d}.txt"
-        )
-        with open(script_file, 'w', encoding='utf-8') as f:
-            f.write(f"Chapter {chapter_num}: {series_title}\n\n{tts_script}")
-        
-        return tts_script
-    
-    def _deep_clean_script(self, text: str) -> str:
-        """Deep clean script for TTS - remove all problematic characters"""
-        
-        # Remove ALL markdown formatting
-        text = re.sub(r'\*+', '', text)  # Remove all asterisks
-        text = re.sub(r'#+', '', text)  # Remove all hashes
-        text = re.sub(r'_+', '', text)  # Remove underscores
-        
-        # Remove ALL brackets and parentheses content
-        text = re.sub(r'\[.*?\]', '', text)  # Remove [content]
-        text = re.sub(r'\(.*?\)', '', text)  # Remove (content)
-        text = re.sub(r'\{.*?\}', '', text)  # Remove {content}
-        
-        # Remove panel/scene markers (multiple patterns)
-        text = re.sub(r'(?i)panel\s*\d+', '', text)
-        text = re.sub(r'(?i)scene\s*\d+', '', text)
-        text = re.sub(r'(?i)दृश्य\s*\d+', '', text)
-        text = re.sub(r'(?i)पैनल\s*\d+', '', text)
-        
-        # Remove visual/caption markers
-        text = re.sub(r'(?i)visual:', '', text)
-        text = re.sub(r'(?i)caption:', '', text)
-        text = re.sub(r'(?i)narrator:', '', text)
-        text = re.sub(r'(?i)कथावाचक:', '', text)
-        
-        # Remove ALL emojis and special symbols
+        # Remove emojis
         emoji_pattern = re.compile("["
-            u"\U0001F600-\U0001F64F"  # emoticons
-            u"\U0001F300-\U0001F5FF"  # symbols & pictographs
-            u"\U0001F680-\U0001F6FF"  # transport & map
-            u"\U0001F1E0-\U0001F1FF"  # flags
-            u"\U00002500-\U00002BEF"  # chinese/japanese/korean
+            u"\U0001F600-\U0001F64F"
+            u"\U0001F300-\U0001F5FF"
+            u"\U0001F680-\U0001F6FF"
+            u"\U0001F1E0-\U0001F1FF"
+            u"\U00002500-\U00002BEF"
             u"\U00002702-\U000027B0"
             u"\U000024C2-\U0001F251"
-            u"\U0001f926-\U0001f937"
-            u"\U00010000-\U0010ffff"
-            u"\u2640-\u2642" 
-            u"\u2600-\u2B55"
-            u"\u200d"
-            u"\u23cf"
-            u"\u23e9"
-            u"\u231a"
-            u"\ufe0f"  # dingbats
-            u"\u3030"
             "]+", flags=re.UNICODE)
         text = emoji_pattern.sub(r'', text)
         
-        # Remove extra separators
-        text = re.sub(r'[=\-_]{3,}', '', text)  # Remove ===, ---, ___
-        text = re.sub(r'[•·∙‣⁃]', '', text)  # Remove bullet points
+        # Remove separators
+        text = re.sub(r'[=\-_]{3,}', '', text)
+        text = re.sub(r'[•·∙‣⁃]', '', text)
         
-        # Fix dialogue markers - convert to natural Hindi
-        # "CHARACTER:" → "Character ने कहा -"
+        # Fix dialogue: "NAME:" → "Name ने कहा -"
         text = re.sub(r'([A-Z][A-Za-z]+):\s*', r'\1 ने कहा - ', text)
         
-        # Remove quotation marks (they cause TTS issues)
+        # Remove quotes
         text = re.sub(r'["""\'\'`]', '', text)
         
-        # Fix spacing issues
-        text = re.sub(r'\s+([।,])', r'\1', text)  # Remove space before punctuation
-        text = re.sub(r'([।,])\s*', r'\1 ', text)  # Add single space after punctuation
-        text = re.sub(r'([.!?])\s*', r'\1 ', text)  # Add single space after sentence endings
+        # Fix spacing
+        text = re.sub(r'\s+([।,])', r'\1', text)
+        text = re.sub(r'([।,])\s*', r'\1 ', text)
+        text = re.sub(r'([.!?])\s*', r'\1 ', text)
         
-        # Clean up whitespace
-        text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 newlines
-        text = re.sub(r' {2,}', ' ', text)  # Single spaces only
-        text = re.sub(r'\t+', ' ', text)  # Replace tabs with space
-        
-        # Remove orphaned punctuation
-        text = re.sub(r'^\s*[,।.!?-]\s*', '', text, flags=re.MULTILINE)
-        
-        # Ensure proper sentence endings
-        text = re.sub(r'([^.!?।])\n', r'\1। ', text)  # Add period if missing at line end
-        
-        return text.strip()
-    
-    def _move_lessons_to_end(self, text: str) -> str:
-        """Move all lesson sections to the end of the script"""
-        
-        # Find all lesson sections (various patterns)
-        lesson_patterns = [
-            r'📚.*?LESSONS.*?\n.*?(?=\n\n|\Z)',
-            r'Lesson \d+:.*?\n.*?(?=\n\n|Lesson|\Z)',
-            r'सबक \d+:.*?\n.*?(?=\n\n|सबक|\Z)',
-            r'इस अध्याय से सीख.*?(?=\n\n|\Z)',
-            r'Chapter.*?Lessons.*?(?=\n\n|\Z)',
-        ]
-        
-        lessons = []
-        for pattern in lesson_patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE | re.DOTALL)
-            for match in matches:
-                lesson_text = match.group(0).strip()
-                if lesson_text and len(lesson_text) > 10:  # Avoid false matches
-                    lessons.append(lesson_text)
-                    text = text.replace(match.group(0), '', 1)  # Remove from original position
-        
-        # Clean up the text after removing lessons
-        text = re.sub(r'\n{3,}', '\n\n', text).strip()
-        
-        # Add all lessons at the end if found
-        if lessons:
-            text += "\n\n" + "="*50 + "\n"
-            text += "इस अध्याय से सीख\n"
-            text += "="*50 + "\n\n"
-            
-            for i, lesson in enumerate(lessons, 1):
-                # Clean the lesson text
-                lesson = re.sub(r'📚|Lesson|सबक', '', lesson, flags=re.IGNORECASE)
-                lesson = re.sub(r'\d+:', '', lesson)
-                lesson = lesson.strip()
-                if lesson:
-                    text += f"{i}. {lesson}\n\n"
-        
-        return text.strip()
-    
-    def _final_tts_validation(self, text: str) -> str:
-        """Final validation and fixes for TTS script"""
-        
-        # Ensure no code blocks or markdown remain
-        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-        text = re.sub(r'`.*?`', '', text)
-        
-        # Remove any remaining special characters that break TTS
-        text = re.sub(r'[<>{}[\]\\|]', '', text)
-        
-        # Fix common TTS pronunciation issues
-        # Ensure numbers are spelled out or in proper format
-        text = re.sub(r'(\d+)\s*-\s*(\d+)', r'\1 से \2', text)  # "1-10" → "1 से 10"
-        
-        # Ensure proper spacing around Devanagari punctuation
-        text = re.sub(r'\s*।\s*', '। ', text)
-        
-        # Remove any lines that are just whitespace or punctuation
-        lines = text.split('\n')
-        cleaned_lines = []
-        for line in lines:
-            if line is None:
-                continue
-            line = str(line).strip()
-            # Skip lines with only punctuation/whitespace
-            # if line and not re.match(r'^[।.,!?;\s=_-]+$', line):
-            #     cleaned_lines.append(line)
-            cleaned_lines.append(line)
-        
-        text = '\n'.join(cleaned_lines)
-        
-        # Final whitespace cleanup
+        # Clean whitespace
         text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r' +', ' ', text)
-        
-        # Ensure text ends with proper punctuation
-        if text and not text[-1] in '.।!?':
-            text += '।'
+        text = re.sub(r' {2,}', ' ', text)
+        text = re.sub(r'\t+', ' ', text)
         
         return text.strip()
     
-    def text_to_speech(
-        self, 
-        text: str, 
-        output_path: str,
-        progress_callback=None
-    ) -> bool:
-        """Convert text to speech audio with progress tracking"""
-        if not self.kokoro:
-            st.error("TTS not initialized")
-            return False
-        
-        try:
-            if progress_callback:
-                progress_callback("🎵 Converting text to phonemes...", 0.1)
-            
-            phonemes, _ = self.g2p(text)
-            MAX_PHONEMES = 480
-            chunks = [phonemes[i:i + MAX_PHONEMES] for i in range(0, len(phonemes), MAX_PHONEMES)]
-            
-            all_samples = []
-            total_chunks = len(chunks)
-            
-            for idx, chunk in enumerate(chunks):
-                if progress_callback:
-                    progress = 0.1 + (0.8 * (idx + 1) / total_chunks)
-                    progress_callback(f"🎵 Generating audio chunk {idx+1}/{total_chunks}...", progress)
-                
-                samples, sample_rate = self.kokoro.create(
-                    chunk, self.voice, self.speed, is_phonemes=True
-                )
-                all_samples.append(samples)
-            
-            if progress_callback:
-                progress_callback("💾 Saving audio file...", 0.95)
-            
-            full_audio = np.concatenate(all_samples)
-            sf.write(output_path, full_audio, sample_rate)
-            
-            duration = len(full_audio) / sample_rate / 60
-            
-            if progress_callback:
-                progress_callback(f"✅ Audio complete: {duration:.1f} minutes", 1.0)
-            
-            return True
-            
-        except Exception as e:
-            st.error(f"Audio generation failed: {e}")
-            import traceback
-            st.error(traceback.format_exc())
-            return False
+    def _save_metadata(self, data: Dict, filename: str):
+        """Save metadata to file"""
+        filepath = os.path.join(
+            METADATA_DIR,
+            f"{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     
-    def generate_chapter_with_audio(
-        self,
-        series_data: Dict,
-        chapter_num: int,
-        user_id: str = "default_user"
-    ) -> Tuple[str, str, str]:
-        """Generate chapter content, TTS script, AND audio with progress"""
+    def save_chapter(self, chapter_num: int, content: str, series_title: str):
+        """Save chapter content"""
+        filename = f"{series_title.replace(' ', '_')}_ch{chapter_num:03d}.txt"
+        filepath = os.path.join(OUTPUT_DIR, filename)
         
-        # Progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
         
-        def update_progress(msg: str, progress: float):
-            status_text.text(msg)
-            progress_bar.progress(progress)
-        
-        # Step 1: Generate chapter content
-        update_progress("📝 Generating chapter content...", 0.1)
-        chapter_content = self.generate_chapter_content(series_data, chapter_num, user_id)
-        
-        if not chapter_content:
-            return None, None, None
-        
-        update_progress("✅ Chapter generated", 0.3)
-        
-        # Step 2: Generate TTS script
-        update_progress("🎙️ Creating TTS narration script...", 0.4)
-        tts_script = self.generate_tts_script(
-            chapter_content,
-            chapter_num,
-            series_data['series_title'],
-            user_id,
-            lambda msg, prog: update_progress(msg, 0.4 + prog * 0.2)
-        )
-        
-        if not tts_script:
-            st.warning("⚠️ TTS script generation failed")
-            return chapter_content, None, None
-        
-        update_progress("✅ TTS script ready", 0.6)
-        
-        # Step 3: Generate audio from TTS script
-        audio_file = os.path.join(
-            OUTPUT_DIR,
-            f"{series_data['skill_topic'].replace(' ', '_')}_ch{chapter_num:03d}.wav"
-        )
-        
-        update_progress("🎵 Generating audio...", 0.65)
-        success = self.text_to_speech(
-            tts_script,
-            audio_file,
-            lambda msg, prog: update_progress(msg, 0.65 + prog * 0.35)
-        )
-        
-        progress_bar.progress(1.0)
-        status_text.text("✅ Complete!")
-        
-        return chapter_content, tts_script, audio_file if success else None
+        return filepath
+    
+    def get_rate_limit_status(self) -> Dict:
+        """Get current rate limit status"""
+        return {
+            'requests_this_minute': len(self.rate_limiter.request_times),
+            'requests_today': self.rate_limiter.daily_requests,
+            'rpm_limit': self.rate_limiter.rpm,
+            'rpd_limit': self.rate_limiter.rpd,
+            'can_request': self.rate_limiter.can_make_request()[0]
+        }
 
 
 # Streamlit UI
 def main():
     st.set_page_config(
-        page_title="Educational Manhwa Generator",
+        page_title="Hindi Manhwa Content Generator",
         page_icon="📚",
         layout="wide"
     )
     
-    st.title("📚 Educational Manhwa Audiobook Generator")
-    st.markdown("*YouTube-style Hindi narration with clean TTS*")
+    st.title("📚 Hindi Educational Manhwa Content Generator")
+    st.markdown("*विस्तृत, संदर्भ-जागरूक हिंदी audiobook scripts*")
     
     # Sidebar
     with st.sidebar:
@@ -934,309 +570,414 @@ def main():
         model_choice = st.selectbox(
             "Model",
             options=list(GEMINI_MODELS.keys()),
-            index=0
-        )
-        
-        voice_choice = st.selectbox(
-            "Voice",
-            options=list(VOICES.keys()),
-            index=0
-        )
-        
-        speech_speed = st.slider(
-            "Speed",
-            0.5, 2.0, 1.0, 0.1
+            format_func=lambda x: f"{x} - {GEMINI_MODELS[x]['description']}"
         )
         
         st.markdown("---")
-        custom_instructions = st.text_area(
-            "Custom Instructions",
-            height=100,
-            placeholder="e.g., Focus on business scenarios, add humor..."
-        )
-    
+        st.subheader("📊 Rate Limits (Free Tier)")
+        if model_choice:
+            config = GEMINI_MODELS[model_choice]
+            st.info(f"""
+**{model_choice}**
+- {config['rpm']} requests/minute
+- {config['tpm']:,} tokens/minute  
+- {config['rpd']} requests/day
+            """)
+        
+        # Check if key exists AND if the object is actually instantiated (not None)
+        if 'generator' in st.session_state and st.session_state.generator is not None:
+            status = st.session_state.generator.get_rate_limit_status()
+            st.metric("Requests this minute", f"{status['requests_this_minute']}/{status['rpm_limit']}")
+            st.metric("Requests today", f"{status['requests_today']}/{status['rpd_limit']}")
     if not gemini_api_key:
-        st.warning("⚠️ Enter Gemini API key")
+        st.warning("⚠️ Please enter Gemini API key in sidebar")
         return
     
-    # Session state
+    # Initialize session state
     if 'generator' not in st.session_state:
         st.session_state.generator = None
-    if 'series_data' not in st.session_state:
-        st.session_state.series_data = None
-    if 'current_chapter' not in st.session_state:
-        st.session_state.current_chapter = 1
+    if 'series_foundation' not in st.session_state:
+        st.session_state.series_foundation = None
+    if 'generated_chapters' not in st.session_state:
+        st.session_state.generated_chapters = {}
     
     # Topic input
-    st.header("🎯 Select Learning Topic")
+    st.header("🎯 Step 1: Create Series Foundation")
     
     col1, col2 = st.columns([3, 1])
     with col1:
         skill_topic = st.text_input(
-            "Skill to Learn",
-            placeholder="e.g., Negotiation, Leadership, Strategic Thinking...",
+            "सीखने का विषय (Learning Topic)",
+            placeholder="जैसे: Negotiation, Leadership, Strategic Thinking...",
         )
     with col2:
         st.write("")
         st.write("")
-        generate_btn = st.button("🎬 Generate Series", type="primary")
+        create_series = st.button("🎬 Create Series", type="primary")
     
-    # Generate series
-    if generate_btn and skill_topic:
+    # Create series foundation
+    if create_series and skill_topic:
         
         # Initialize generator
-        st.session_state.generator = ManhwaStoryGenerator(
+        st.session_state.generator = HindiManhwaGenerator(
             gemini_api_key=gemini_api_key,
-            model_id=GEMINI_MODELS[model_choice],
-            voice=VOICES[voice_choice],
-            speed=speech_speed,
-            custom_instructions=custom_instructions
+            model_choice=model_choice
         )
         
-        # Progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        def update_progress(msg, progress):
-            status_text.text(msg)
-            progress_bar.progress(progress)
-        
-        # Generate
-        with st.spinner("Generating series..."):
-            series_data = st.session_state.generator.generate_complete_series(
-                skill_topic,
-                user_id="streamlit_user",
-                progress_callback=update_progress
-            )
+        with st.spinner("सीरीज़ की नींव बना रहे हैं..."):
+            foundation = st.session_state.generator.generate_series_foundation(skill_topic)
             
-            if series_data:
-                st.session_state.series_data = series_data
-                st.session_state.current_chapter = 1
+            if foundation:
+                st.session_state.series_foundation = foundation
                 st.balloons()
-                st.success(f"✅ Generated {len(series_data['chapters'])} chapters!")
+                st.success("✅ सीरीज़ की नींव तैयार!")
             else:
-                st.error("❌ Generation failed")
+                st.error("❌ Foundation generation failed")
     
-    # Display series
-    if st.session_state.series_data:
-        series = st.session_state.series_data
-        
-        # Validate series data
-        if not isinstance(series, dict):
-            st.error("❌ Invalid series data. Please regenerate.")
-            if st.button("🔄 Clear and Retry"):
-                st.session_state.series_data = None
-                st.rerun()
-            return
+    # Display series foundation
+    if st.session_state.series_foundation:
+        foundation = st.session_state.series_foundation
         
         st.markdown("---")
-        st.header(f"📖 {series.get('series_title', 'Untitled Series')}")
+        st.header(f"📖 {foundation.get('series_title', 'Series')}")
         
-        # Overview
-        with st.expander("📜 Story Overview", expanded=True):
-            st.write(series.get('story_overview', 'No overview available'))
+        col1, col2 = st.columns([2, 1])
         
-        # Characters
-        if series.get('characters'):
-            with st.expander("👥 Characters"):
-                for char in series['characters']:
+        with col1:
+            with st.expander("📜 Story Overview", expanded=True):
+                st.write(foundation.get('story_overview', 'No overview'))
+                st.write(f"**Main Storyline:** {foundation.get('main_storyline', 'N/A')}")
+                st.write(f"**Central Conflict:** {foundation.get('central_conflict', 'N/A')}")
+                st.write(f"**World Setting:** {foundation.get('world_setting', 'N/A')}")
+        
+        with col2:
+            with st.expander("👥 Characters", expanded=True):
+                for char in foundation.get('characters', []):
                     st.markdown(f"**{char.get('name', 'Unknown')}** - *{char.get('role', 'N/A')}*")
-                    st.write(f"_{char.get('personality', 'N/A')}_")
-                    st.caption(char.get('background', 'N/A'))
+                    st.caption(char.get('personality', 'N/A'))
+                    st.caption(f"Arc: {char.get('character_arc', 'N/A')}")
                     st.markdown("---")
         
-        # Chapters
-        if series.get('chapters'):
-            with st.expander(f"📚 All {len(series['chapters'])} Chapters"):
-                for ch in series['chapters']:
-                    col1, col2 = st.columns([1, 5])
-                    with col1:
-                        st.write(f"**Ch {ch.get('chapter_num', '?')}**")
-                    with col2:
-                        st.write(f"**{ch.get('title', 'Untitled')}** ({ch.get('difficulty', 'N/A')})")
-                        st.caption(ch.get('lesson_focus', 'No description'))
-        else:
-            st.info("📝 No chapters generated yet")
-        
-        st.markdown("---")
-        
         # Chapter generation
-        st.header("✍️ Generate Chapters with Audio")
+        st.markdown("---")
+        st.header("✍️ Step 2: Generate Chapters")
         
-        # Only show if chapters exist
-        if not series.get('chapters'):
-            st.warning("⚠️ Generate series overview first to create chapters")
-            return
+        st.info("""
+        📝 **Content Format:**
+        - Direct TTS-ready Hindi script (no intermediate steps)
+        - 5000-7000 words per chapter (15-20 minutes audio)
+        - Modern conversational Hindi
+        - Context-aware (remembers previous chapters)
+        - Lessons at the end (5-8 lines)
+        """)
+        
+        # Single chapter generation
+        st.subheader("Generate Single Chapter")
         
         col1, col2, col3 = st.columns([2, 1, 1])
         
         with col1:
             chapter_num = st.number_input(
-                "Chapter",
-                1, len(series['chapters']),
-                st.session_state.current_chapter
+                "Chapter Number",
+                min_value=1,
+                max_value=100,
+                value=1,
+                key="single_chapter"
             )
         
         with col2:
             st.write("")
             st.write("")
-            gen_ch = st.button("📝 Generate Chapter", type="primary")
+            gen_single = st.button("📝 Generate Chapter", type="primary")
         
         with col3:
             st.write("")
             st.write("")
-            gen_range = st.button("📚 Generate Range")
+            if chapter_num in st.session_state.generated_chapters:
+                st.success("✅ Generated")
         
-        # Generate single chapter
-        if gen_ch:
-            st.subheader(f"📖 Generating Chapter {chapter_num}")
-            
-            with st.spinner(f"Processing Chapter {chapter_num}..."):
-                content, tts_script, audio = st.session_state.generator.generate_chapter_with_audio(
-                    series, chapter_num, "streamlit_user"
+        if gen_single:
+            with st.spinner(f"अध्याय {chapter_num} बना रहे हैं..."):
+                progress_bar = st.progress(0)
+                status = st.empty()
+                
+                # Step 1: Generate outline
+                status.text("📋 Creating chapter outline...")
+                progress_bar.progress(0.2)
+                
+                outline = st.session_state.generator.generate_chapter_outline(
+                    chapter_num,
+                    foundation
                 )
                 
-                if content:
-                    # Display chapter content
-                    with st.expander(f"📖 Chapter {chapter_num} - Original Manhwa", expanded=False):
-                        st.text_area("Manhwa Content", content, height=400, key=f"content_{chapter_num}")
+                if not outline:
+                    st.error(f"❌ Failed to create outline for chapter {chapter_num}")
+                else:
+                    # Step 2: Generate content
+                    status.text("✍️ Writing detailed Hindi script...")
+                    progress_bar.progress(0.4)
                     
-                    # Display TTS script
-                    if tts_script:
-                        with st.expander(f"🎙️ Chapter {chapter_num} - TTS Narration Script", expanded=True):
-                            st.text_area("Clean Narration", tts_script, height=400, key=f"script_{chapter_num}")
+                    content = st.session_state.generator.generate_chapter_content(
+                        chapter_num,
+                        outline,
+                        foundation
+                    )
+                    
+                    if content:
+                        # Save chapter
+                        status.text("💾 Saving chapter...")
+                        progress_bar.progress(0.8)
+                        
+                        filepath = st.session_state.generator.save_chapter(
+                            chapter_num,
+                            content,
+                            foundation['series_title']
+                        )
+                        
+                        # Store in session
+                        st.session_state.generated_chapters[chapter_num] = {
+                            'outline': outline,
+                            'content': content,
+                            'filepath': filepath
+                        }
+                        
+                        progress_bar.progress(1.0)
+                        status.text("✅ Chapter complete!")
+                        st.success(f"✅ अध्याय {chapter_num} तैयार!")
+                        
+                        # Display chapter
+                        with st.expander(f"📖 Chapter {chapter_num}: {outline['title']}", expanded=True):
                             
-                            # Download TTS script
+                            # Outline info
+                            st.markdown("**Chapter Outline:**")
+                            st.write(f"**Focus:** {outline.get('lesson_focus', 'N/A')}")
+                            st.write(f"**Plot:** {outline.get('plot_summary', 'N/A')}")
+                            st.write(f"**Cliffhanger:** {outline.get('cliffhanger', 'N/A')}")
+                            
+                            st.markdown("---")
+                            
+                            # Content
+                            st.markdown("**TTS-Ready Script:**")
+                            
+                            # Show word count
+                            word_count = len(content.split())
+                            st.caption(f"📊 Word Count: {word_count:,} words (~{word_count*0.003:.1f} minutes)")
+                            
+                            st.text_area(
+                                "Content",
+                                content,
+                                height=400,
+                                key=f"content_{chapter_num}"
+                            )
+                            
+                            # Download button
                             st.download_button(
-                                "⬇️ Download TTS Script",
-                                tts_script,
-                                file_name=f"tts_script_ch{chapter_num:03d}.txt",
+                                "⬇️ Download Chapter",
+                                content,
+                                file_name=f"chapter_{chapter_num:03d}.txt",
                                 mime="text/plain"
                             )
-                    
-                    # Display audio
-                    if audio and os.path.exists(audio):
-                        st.success("✅ Audio generated successfully!")
-                        st.audio(audio)
-                        
-                        with open(audio, 'rb') as f:
-                            st.download_button(
-                                "⬇️ Download Audio",
-                                f,
-                                file_name=os.path.basename(audio),
-                                mime="audio/wav"
-                            )
-                    
-                    # Move to next chapter
-                    st.session_state.current_chapter = min(chapter_num + 1, len(series['chapters']))
-                    
-                else:
-                    st.error("❌ Chapter generation failed")
+                    else:
+                        st.error(f"❌ Failed to generate content for chapter {chapter_num}")
         
-        # Generate range
-        if gen_range:
+        # Batch generation
+        st.markdown("---")
+        st.subheader("Generate Multiple Chapters")
+        
+        col1, col2, col3 = st.columns([2, 2, 1])
+        
+        with col1:
+            start_ch = st.number_input(
+                "From Chapter",
+                min_value=1,
+                max_value=100,
+                value=1,
+                key="batch_start"
+            )
+        
+        with col2:
+            end_ch = st.number_input(
+                "To Chapter",
+                min_value=1,
+                max_value=100,
+                value=min(5, 100),
+                key="batch_end"
+            )
+        
+        with col3:
+            st.write("")
+            st.write("")
+            gen_batch = st.button("🚀 Generate Batch")
+        
+        if gen_batch and start_ch <= end_ch:
+            st.info(f"🚀 Generating chapters {start_ch} to {end_ch}...")
+            
+            # Overall progress
+            overall_progress = st.progress(0)
+            overall_status = st.empty()
+            
+            success_count = 0
+            failed_chapters = []
+            
+            for i in range(start_ch, end_ch + 1):
+                overall_status.text(f"📝 Processing Chapter {i}/{end_ch}...")
+                
+                # Skip if already generated
+                if i in st.session_state.generated_chapters:
+                    st.info(f"⏭️ Chapter {i} already exists, skipping...")
+                    success_count += 1
+                    continue
+                
+                with st.expander(f"Chapter {i}", expanded=False):
+                    try:
+                        # Generate outline
+                        st.text("📋 Creating outline...")
+                        outline = st.session_state.generator.generate_chapter_outline(i, foundation)
+                        
+                        if not outline:
+                            st.error(f"❌ Outline failed")
+                            failed_chapters.append(i)
+                            continue
+                        
+                        # Generate content
+                        st.text("✍️ Writing script...")
+                        content = st.session_state.generator.generate_chapter_content(
+                            i, outline, foundation
+                        )
+                        
+                        if not content:
+                            st.error(f"❌ Content generation failed")
+                            failed_chapters.append(i)
+                            continue
+                        
+                        # Save
+                        filepath = st.session_state.generator.save_chapter(
+                            i, content, foundation['series_title']
+                        )
+                        
+                        # Store
+                        st.session_state.generated_chapters[i] = {
+                            'outline': outline,
+                            'content': content,
+                            'filepath': filepath
+                        }
+                        
+                        word_count = len(content.split())
+                        st.success(f"✅ Chapter {i} complete! ({word_count:,} words)")
+                        success_count += 1
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error: {e}")
+                        failed_chapters.append(i)
+                
+                # Update progress
+                progress = (i - start_ch + 1) / (end_ch - start_ch + 1)
+                overall_progress.progress(progress)
+            
+            # Final summary
+            overall_status.empty()
+            overall_progress.progress(1.0)
+            
             st.markdown("---")
-            st.subheader("📚 Generate Chapter Range")
+            st.subheader("📊 Batch Generation Summary")
             
             col1, col2, col3 = st.columns(3)
             with col1:
-                start_ch = st.number_input("From Chapter", 1, 100, 1, key="start_ch")
+                st.metric("Total Chapters", end_ch - start_ch + 1)
             with col2:
-                end_ch = st.number_input("To Chapter", 1, 100, min(10, len(series['chapters'])), key="end_ch")
+                st.metric("Successful", success_count, delta=success_count)
             with col3:
-                st.write("")
-                st.write("")
-                confirm = st.button("✅ Start Batch Generation")
+                st.metric("Failed", len(failed_chapters), delta=-len(failed_chapters))
             
-            if confirm and start_ch <= end_ch:
-                st.info(f"🚀 Starting batch generation: Chapters {start_ch} to {end_ch}")
+            if failed_chapters:
+                st.warning(f"⚠️ Failed chapters: {', '.join(map(str, failed_chapters))}")
+            else:
+                st.success("🎉 All chapters generated successfully!")
+                st.balloons()
+        
+        # View generated chapters
+        if st.session_state.generated_chapters:
+            st.markdown("---")
+            st.subheader("📚 Generated Chapters")
+            
+            st.write(f"Total generated: **{len(st.session_state.generated_chapters)}** chapters")
+            
+            for ch_num in sorted(st.session_state.generated_chapters.keys()):
+                ch_data = st.session_state.generated_chapters[ch_num]
                 
-                # Overall progress
-                overall_progress = st.progress(0)
-                overall_status = st.empty()
-                
-                success_count = 0
-                failed_chapters = []
-                
-                for i in range(start_ch, end_ch + 1):
-                    overall_status.text(f"📝 Processing Chapter {i} of {end_ch}...")
+                with st.expander(f"Chapter {ch_num}: {ch_data['outline']['title']}"):
                     
-                    # Create expander for this chapter
-                    with st.expander(f"Chapter {i}", expanded=False):
-                        chapter_status = st.empty()
-                        chapter_status.info(f"⏳ Generating Chapter {i}...")
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        st.write(f"**Lesson:** {ch_data['outline'].get('lesson_focus', 'N/A')}")
+                        st.write(f"**Plot:** {ch_data['outline'].get('plot_summary', 'N/A')[:200]}...")
                         
-                        content, tts_script, audio = st.session_state.generator.generate_chapter_with_audio(
-                            series, i, "streamlit_user"
+                        word_count = len(ch_data['content'].split())
+                        st.caption(f"📊 {word_count:,} words (~{word_count*0.003:.1f} min)")
+                    
+                    with col2:
+                        st.download_button(
+                            "⬇️ Download",
+                            ch_data['content'],
+                            file_name=f"chapter_{ch_num:03d}.txt",
+                            key=f"download_{ch_num}"
                         )
                         
-                        if content and tts_script:
-                            chapter_status.success(f"✅ Chapter {i} complete!")
-                            success_count += 1
-                            
-                            # Show brief info
-                            st.caption(f"📝 Content: {len(content)} characters")
-                            st.caption(f"🎙️ TTS Script: {len(tts_script)} characters")
-                            if audio and os.path.exists(audio):
-                                st.caption(f"🎵 Audio: {os.path.basename(audio)}")
-                        else:
-                            chapter_status.error(f"❌ Chapter {i} failed")
-                            failed_chapters.append(i)
-                    
-                    # Update overall progress
-                    progress = (i - start_ch + 1) / (end_ch - start_ch + 1)
-                    overall_progress.progress(progress)
-                
-                # Final summary
-                overall_status.empty()
-                overall_progress.progress(1.0)
-                
-                st.markdown("---")
-                st.subheader("📊 Batch Generation Summary")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Chapters", end_ch - start_ch + 1)
-                with col2:
-                    st.metric("Successful", success_count, delta=success_count)
-                with col3:
-                    st.metric("Failed", len(failed_chapters), delta=-len(failed_chapters))
-                
-                if failed_chapters:
-                    st.warning(f"⚠️ Failed chapters: {', '.join(map(str, failed_chapters))}")
-                else:
-                    st.success("🎉 All chapters generated successfully!")
-                    st.balloons()
+                        if st.button("👁️ View", key=f"view_{ch_num}"):
+                            st.text_area(
+                                "Content",
+                                ch_data['content'],
+                                height=300,
+                                key=f"view_content_{ch_num}"
+                            )
         
-        # Additional utilities
+        # Utilities
         st.markdown("---")
         st.subheader("🔧 Utilities")
         
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            if st.button("📂 View Generated Files"):
-                st.info("**Generated Files:**")
-                st.write(f"📁 Chapters: `{CHAPTERS_DIR}/`")
-                st.write(f"📁 TTS Scripts: `{SCRIPTS_DIR}/`")
-                st.write(f"📁 Audio: `{OUTPUT_DIR}/`")
-                st.write(f"📁 Metadata: `{METADATA_DIR}/`")
+            if st.button("📂 View Files"):
+                st.info(f"""
+**Generated Files:**
+- Content: `{OUTPUT_DIR}/`
+- Metadata: `{METADATA_DIR}/`
+- Database: `manhwa_knowledge.db`
+                """)
         
         with col2:
             if st.button("🔄 Reset Session"):
-                st.session_state.series_data = None
-                st.session_state.current_chapter = 1
-                st.success("✅ Session reset! Generate a new series.")
+                st.session_state.series_foundation = None
+                st.session_state.generated_chapters = {}
+                st.session_state.generator = None
+                st.success("✅ Session reset!")
                 st.rerun()
         
         with col3:
-            if st.button("💾 Export Metadata"):
-                if series:
-                    metadata_json = json.dumps(series, ensure_ascii=False, indent=2)
+            if st.button("💾 Export All"):
+                if st.session_state.generated_chapters:
+                    # Create combined export
+                    all_chapters = []
+                    for ch_num in sorted(st.session_state.generated_chapters.keys()):
+                        ch_data = st.session_state.generated_chapters[ch_num]
+                        all_chapters.append({
+                            'chapter_num': ch_num,
+                            'title': ch_data['outline']['title'],
+                            'content': ch_data['content']
+                        })
+                    
+                    export_data = {
+                        'series_foundation': foundation,
+                        'chapters': all_chapters,
+                        'total_chapters': len(all_chapters)
+                    }
+                    
                     st.download_button(
-                        "⬇️ Download Series Metadata",
-                        metadata_json,
-                        file_name=f"{series.get('skill_topic', 'series').replace(' ', '_')}_metadata.json",
+                        "⬇️ Download All",
+                        json.dumps(export_data, ensure_ascii=False, indent=2),
+                        file_name=f"{foundation['series_title'].replace(' ', '_')}_complete.json",
                         mime="application/json"
                     )
 
