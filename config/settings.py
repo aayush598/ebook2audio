@@ -20,7 +20,9 @@ GEMINI_MODELS = {
     'gemini-2.0-flash-lite': {'rpm': 30, 'tpm': 1_000_000, 'rpd': 200},
     'gemini-2.0-flash-exp': {'rpm': 15, 'tpm': 1_000_000, 'rpd': 200},
     'gemini-2.5-flash': {'rpm': 10, 'tpm': 250_000, 'rpd': 250},
+    'gemini-2.5-flash-lite': {'rpm': 15, 'tpm': 250_000, 'rpd': 1000},
+    'gemini-2.5-flash-lite-preview-09-2025': {'rpm': 15, 'tpm': 250_000, 'rpd': 1000},
 }
 
 # Default model
-DEFAULT_MODEL = 'gemini-2.0-flash-lite'
+DEFAULT_MODEL = 'gemini-2.5-flash-lite-preview-09-2025'
