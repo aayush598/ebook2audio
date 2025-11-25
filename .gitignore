@@ -8,3 +8,4 @@ manhwa_*
 tts_scripts
 chapter_context
 *.db
+__pycache__
